@@ -1,197 +1,356 @@
-import 'dart:convert'; // For turning our data into text so it can be saved
-import 'package:flutter/material.dart';
-import 'package:shared_preferences/shared_preferences.dart'; // For local storage
-import 'notification_service.dart'; // Schedules the medication reminders
+import 'dart:async';
 
-// ─── App Entry Point ───────────────────────────────────────────────────────
+import 'package:flutter/material.dart';
+
+import 'medication_state.dart';
+import 'notification_service.dart';
 
 void main() async {
-  // This line is required before using SharedPreferences.
-  // It makes sure Flutter is fully set up before we touch storage.
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Set up the notification plugin and ask for the permissions we need
-  // (showing notifications, and scheduling them at an exact time) before
-  // the user even opens the Add Medication screen.
-  await NotificationService.instance.init();
-  await NotificationService.instance.requestPermissions();
+  String? notificationWarning;
+  try {
+    await NotificationService.instance.init();
+    final permissionsGranted = await NotificationService.instance
+        .requestPermissions();
+    if (!permissionsGranted) {
+      notificationWarning =
+          'Notification or exact-alarm access is off. Reminders may not appear on time.';
+    }
+  } catch (_) {
+    notificationWarning =
+        'Reminders are unavailable right now. You can still review the medication schedule.';
+  }
 
-  runApp(const MedTrackerApp());
+  runApp(MedTrackerApp(initialNotificationWarning: notificationWarning));
 }
 
-// ─── Data Model ────────────────────────────────────────────────────────────
-
-/// Represents one medication the user wants to track.
-class Medication {
-  final int id; // Also used as the notification id for this medication.
-  final String name;
-  final String dosage;
-  final String time; // Displayed as "8:30 AM"
-  final int hour; // 24-hour hour (0-23), used to schedule the reminder.
-  final int minute; // 0-59, used to schedule the reminder.
-
-  Medication({
-    required this.id,
-    required this.name,
-    required this.dosage,
-    required this.time,
-    required this.hour,
-    required this.minute,
+class MedTrackerApp extends StatelessWidget {
+  const MedTrackerApp({
+    super.key,
+    this.initialNotificationWarning,
+    this.nowProvider = DateTime.now,
   });
 
-  /// Turn this medication into a Map so it can be saved as JSON text.
-  Map<String, dynamic> toJson() => {
-        'id': id,
-        'name': name,
-        'dosage': dosage,
-        'time': time,
-        'hour': hour,
-        'minute': minute,
-      };
-
-  /// Recreate a Medication from a Map that was loaded out of storage.
-  factory Medication.fromJson(Map<String, dynamic> json) => Medication(
-        // Older saved medications (from before reminders were added) won't
-        // have an id/hour/minute yet, so fall back to sensible defaults
-        // rather than crashing.
-        id: json['id'] as int? ??
-            DateTime.now().millisecondsSinceEpoch.remainder(1000000000),
-        name: json['name'] as String,
-        dosage: json['dosage'] as String,
-        time: json['time'] as String,
-        hour: json['hour'] as int? ?? 8,
-        minute: json['minute'] as int? ?? 0,
-      );
-}
-
-// ─── Storage Helper ────────────────────────────────────────────────────────
-
-/// All the code for reading and writing medications to the device lives here.
-///
-/// SharedPreferences stores simple key→value pairs on the device.
-/// Because it can only store strings, we convert each Medication to a JSON
-/// string before saving, and parse it back when loading.
-class MedicationStorage {
-  // The key used to look up our list inside SharedPreferences.
-  static const _storageKey = 'medications';
-
-  /// Load all saved medications from the device.
-  /// Returns an empty list if nothing has been saved yet.
-  static Future<List<Medication>> load() async {
-    final prefs = await SharedPreferences.getInstance();
-    // getStringList returns null if the key doesn't exist yet, so we use ?? []
-    final jsonStrings = prefs.getStringList(_storageKey) ?? [];
-    return jsonStrings
-        .map((s) => Medication.fromJson(jsonDecode(s) as Map<String, dynamic>))
-        .toList();
-  }
-
-  /// Save the full list of medications to the device, replacing the old list.
-  static Future<void> save(List<Medication> medications) async {
-    final prefs = await SharedPreferences.getInstance();
-    final jsonStrings =
-        medications.map((m) => jsonEncode(m.toJson())).toList();
-    await prefs.setStringList(_storageKey, jsonStrings);
-  }
-}
-
-// ─── App Root ──────────────────────────────────────────────────────────────
-
-/// The root of the app. Sets up the overall look and feel.
-class MedTrackerApp extends StatelessWidget {
-  const MedTrackerApp({super.key});
+  final String? initialNotificationWarning;
+  final DateTime Function() nowProvider;
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'My Medications',
+      title: 'MedMinder',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF1A4B8C), // deep blue
-        ),
-        // ── Larger text throughout the whole app ──
+        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF1A4B8C)),
         textTheme: const TextTheme(
           bodyLarge: TextStyle(fontSize: 20),
           bodyMedium: TextStyle(fontSize: 18),
           titleLarge: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
-          labelLarge: TextStyle(fontSize: 18), // text inside buttons
+          labelLarge: TextStyle(fontSize: 18),
         ),
-        // ── Taller form fields so they are easy to tap ──
         inputDecorationTheme: const InputDecorationTheme(
-          contentPadding:
-              EdgeInsets.symmetric(horizontal: 16, vertical: 20),
+          contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 20),
           border: OutlineInputBorder(),
         ),
         useMaterial3: true,
       ),
-      home: const HomeScreen(),
+      home: HomeScreen(
+        notificationWarning: initialNotificationWarning,
+        nowProvider: nowProvider,
+      ),
     );
   }
 }
 
-// ─── Home Screen ───────────────────────────────────────────────────────────
-
-/// The main screen showing the list of medications.
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({super.key});
+  const HomeScreen({
+    super.key,
+    this.notificationWarning,
+    this.nowProvider = DateTime.now,
+  });
+
+  final String? notificationWarning;
+  final DateTime Function() nowProvider;
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   List<Medication> _medications = [];
-  bool _isLoading = true; // True while we are reading from storage
+  List<MedicationAcknowledgement> _acknowledgements = [];
+  List<MedicationSnooze> _snoozes = [];
+  MedicationOccurrence? _occurrence;
+  MedicationAcknowledgement? _lastAcknowledgement;
+  Medication? _lastAcknowledgedMedication;
+  Timer? _refreshTimer;
+  bool _isLoading = true;
+  bool _actionInProgress = false;
+  String? _storageError;
+  String? _notificationWarning;
+  String? _actionError;
 
   @override
   void initState() {
     super.initState();
-    // Load saved medications as soon as the screen appears.
-    _loadMedications();
+    WidgetsBinding.instance.addObserver(this);
+    _notificationWarning = widget.notificationWarning;
+    _loadState();
   }
 
-  Future<void> _loadMedications() async {
-    final loaded = await MedicationStorage.load();
-    setState(() {
-      _medications = loaded;
-      _isLoading = false;
-    });
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _refreshTimer?.cancel();
+    super.dispose();
   }
 
-  /// Navigate to the Add Medication screen and wait for the result.
-  Future<void> _openAddForm() async {
-    // Navigator.push opens a new screen. When that screen calls Navigator.pop
-    // with a Medication object, it is returned here as `newMed`.
-    final newMed = await Navigator.push<Medication>(
-      context,
-      MaterialPageRoute(builder: (_) => const AddMedicationScreen()),
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _loadState();
+  }
+
+  Future<void> _loadState() async {
+    _refreshTimer?.cancel();
+    final now = widget.nowProvider();
+    try {
+      final loadResult = await MedicationStorage.loadWithMetadata();
+      final medications = loadResult.medications;
+      if (loadResult.migrated) {
+        await NotificationService.instance.reconcileMedicationReminders(
+          medications,
+        );
+      }
+      final acknowledgements =
+          await MedicationStateStorage.loadAcknowledgements(now);
+      final reminderRetries = await ReminderRetryStorage.load();
+      var snoozes = await MedicationStateStorage.loadSnoozes(now);
+
+      final expired = snoozes
+          .where(
+            (value) =>
+                value.scheduledDate != localDateKey(now) ||
+                !value.snoozeUntil.isAfter(now),
+          )
+          .toList();
+      for (final snooze in expired) {
+        await MedicationStateStorage.clearSnooze(
+          snooze.medicationId,
+          snooze.scheduledDate,
+        );
+        if (snooze.scheduledDate != localDateKey(now)) {
+          final cancelled = await NotificationService.instance.cancelSnooze(
+            snooze.medicationId,
+          );
+          if (!cancelled) {
+            _notificationWarning =
+                'An old reminder may still appear. The app will retry cancelling it.';
+          }
+        }
+      }
+      if (expired.isNotEmpty) {
+        snoozes = await MedicationStateStorage.loadSnoozes(now);
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _medications = medications;
+        _acknowledgements = acknowledgements;
+        _snoozes = snoozes;
+        _storageError = null;
+        _isLoading = false;
+        if (reminderRetries.any(
+          (id) => medications.any((medication) => medication.id == id),
+        )) {
+          _notificationWarning =
+              'One or more medication reminders need attention. Open caregiver setup to retry.';
+        }
+      });
+      _recompute(now);
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _isLoading = false;
+        _storageError =
+            'Medication data is unavailable. The app will not treat this as an empty schedule.';
+      });
+    }
+  }
+
+  void _recompute(DateTime now) {
+    final occurrence = MedicationSchedule.nextOccurrence(
+      medications: _medications,
+      acknowledgements: _acknowledgements,
+      snoozes: _snoozes,
+      now: now,
     );
-    // If the user tapped Save (not Cancel), add the new medication.
-    if (newMed != null) {
-      final updated = [..._medications, newMed];
-      setState(() => _medications = updated);
-      await MedicationStorage.save(updated); // Persist to device storage
+    if (mounted) setState(() => _occurrence = occurrence);
+    _armRefreshTimer(now, occurrence);
+  }
 
-      // Schedule a daily reminder that fires at this medication's time.
-      await NotificationService.instance.scheduleDailyMedicationReminder(
-        id: newMed.id,
-        medicationName: newMed.name,
-        dosage: newMed.dosage,
-        hour: newMed.hour,
-        minute: newMed.minute,
+  void _armRefreshTimer(DateTime now, MedicationOccurrence? occurrence) {
+    _refreshTimer?.cancel();
+    final midnight = DateTime(now.year, now.month, now.day + 1);
+    final boundaries = <DateTime>[midnight];
+    if (occurrence != null && occurrence.scheduledAt.isAfter(now)) {
+      boundaries.add(occurrence.scheduledAt);
+    }
+    final snoozeUntil = occurrence?.snoozedUntil;
+    if (snoozeUntil != null && snoozeUntil.isAfter(now)) {
+      boundaries.add(snoozeUntil);
+    }
+    boundaries.sort();
+    final delay = boundaries.first.difference(now) + const Duration(seconds: 1);
+    _refreshTimer = Timer(delay, _loadState);
+  }
+
+  Future<void> _openCaregiverSetup() async {
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(builder: (_) => const CaregiverScheduleScreen()),
+    );
+    if (mounted) await _loadState();
+  }
+
+  Future<void> _retryNotificationPermissions() async {
+    try {
+      await NotificationService.instance.init();
+      final granted = await NotificationService.instance.requestPermissions();
+      if (!mounted) return;
+      setState(
+        () => _notificationWarning = granted
+            ? null
+            : 'Notification or exact-alarm access is still off. Reminders may not appear on time.',
+      );
+    } catch (_) {
+      if (!mounted) return;
+      setState(
+        () => _notificationWarning =
+            'Reminder permissions could not be checked. Please try again.',
       );
     }
   }
 
-  /// Remove the medication at [index] from the list, save, and stop its
-  /// reminder notification.
-  Future<void> _deleteMedication(int index) async {
-    final removed = _medications[index];
-    final updated = [..._medications]..removeAt(index);
-    setState(() => _medications = updated);
-    await MedicationStorage.save(updated);
-    await NotificationService.instance.cancel(removed.id);
+  Future<void> _acknowledge() async {
+    final occurrence = _occurrence;
+    final now = widget.nowProvider();
+    if (occurrence == null ||
+        !occurrence.isActionable(now) ||
+        _actionInProgress) {
+      return;
+    }
+
+    setState(() {
+      _actionError = null;
+      _actionInProgress = true;
+    });
+    final acknowledgement = MedicationAcknowledgement(
+      medicationId: occurrence.medication.id,
+      scheduledDate: occurrence.scheduledDate,
+      acknowledgedAt: now,
+    );
+    try {
+      await MedicationStateStorage.acknowledge(acknowledgement);
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _actionError =
+            'The acknowledgement could not be saved. Please try again.';
+        _actionInProgress = false;
+      });
+      return;
+    }
+
+    if (occurrence.snoozedUntil != null) {
+      try {
+        await MedicationStateStorage.clearSnooze(
+          occurrence.medication.id,
+          occurrence.scheduledDate,
+        );
+      } catch (_) {
+        _notificationWarning =
+            'Marked as taken, but old snooze data could not be cleared.';
+      }
+      try {
+        final cancelled = await NotificationService.instance.cancelSnooze(
+          occurrence.medication.id,
+        );
+        if (!cancelled) {
+          _notificationWarning =
+              'An extra reminder may still appear. The app will retry cancelling it.';
+        }
+      } catch (_) {
+        _notificationWarning =
+            'Marked as taken, but an extra reminder may still appear.';
+      }
+    }
+
+    try {
+      if (!mounted) return;
+      setState(() {
+        _lastAcknowledgement = acknowledgement;
+        _lastAcknowledgedMedication = occurrence.medication;
+      });
+      await _loadState();
+    } finally {
+      if (mounted) setState(() => _actionInProgress = false);
+    }
+  }
+
+  Future<void> _snooze() async {
+    final occurrence = _occurrence;
+    final now = widget.nowProvider();
+    if (occurrence == null ||
+        !occurrence.isActionable(now) ||
+        _actionInProgress) {
+      return;
+    }
+
+    setState(() {
+      _actionError = null;
+      _actionInProgress = true;
+    });
+    final snooze = MedicationSnooze(
+      medicationId: occurrence.medication.id,
+      scheduledDate: occurrence.scheduledDate,
+      snoozeUntil: now.add(const Duration(minutes: 10)),
+    );
+    try {
+      await NotificationService.instance.scheduleSnoozeReminder(
+        medication: occurrence.medication,
+        snoozeUntil: snooze.snoozeUntil,
+      );
+      try {
+        await MedicationStateStorage.saveSnooze(snooze);
+      } catch (_) {
+        final cancelled = await NotificationService.instance.cancelSnooze(
+          occurrence.medication.id,
+        );
+        if (!cancelled) {
+          _notificationWarning =
+              'An extra reminder may appear because snooze recovery failed.';
+        }
+        rethrow;
+      }
+      if (!mounted) return;
+      await _loadState();
+    } catch (_) {
+      if (!mounted) return;
+      setState(
+        () => _actionError =
+            'The reminder could not be scheduled. Please try again.',
+      );
+    } finally {
+      if (mounted) setState(() => _actionInProgress = false);
+    }
+  }
+
+  void _continueAfterAcknowledgement() {
+    setState(() {
+      _lastAcknowledgement = null;
+      _lastAcknowledgedMedication = null;
+    });
+    _recompute(widget.nowProvider());
   }
 
   @override
@@ -199,35 +358,281 @@ class _HomeScreenState extends State<HomeScreen> {
     return Scaffold(
       backgroundColor: Colors.white,
       appBar: AppBar(
-        backgroundColor: const Color(0xFF1A4B8C), // deep blue = high contrast
-        foregroundColor: Colors.white,
-        title: const Text(
-          'My Medications',
-          style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold),
-        ),
-      ),
-      // Show a spinner, the empty state, or the list depending on app state.
-      body: _isLoading
-          ? const Center(child: CircularProgressIndicator())
-          : _medications.isEmpty
-              ? _buildEmptyState()
-              : _buildMedicationList(),
-      // A large, labelled button so the action is obvious.
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _openAddForm,
         backgroundColor: const Color(0xFF1A4B8C),
         foregroundColor: Colors.white,
-        icon: const Icon(Icons.add, size: 30),
-        label: const Text(
-          'Add Medication',
-          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+        title: const Text(
+          'My Medication',
+          style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold),
+        ),
+        actions: [
+          TextButton(
+            onPressed: _openCaregiverSetup,
+            style: TextButton.styleFrom(foregroundColor: Colors.white),
+            child: const Text('Caregiver setup'),
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: Column(
+          children: [
+            if (_notificationWarning != null)
+              _MessageBanner(
+                message: _notificationWarning!,
+                icon: Icons.notifications_off_outlined,
+                actionLabel: 'Retry',
+                onAction: _retryNotificationPermissions,
+                onDismiss: () => setState(() => _notificationWarning = null),
+              ),
+            Expanded(child: _buildBody()),
+          ],
         ),
       ),
     );
   }
 
-  /// Friendly message shown when the list is empty.
-  Widget _buildEmptyState() {
+  Widget _buildBody() {
+    if (_isLoading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_storageError != null) {
+      return _StorageUnavailableState(
+        message: _storageError!,
+        onRetry: _loadState,
+        onOpenCaregiver: _openCaregiverSetup,
+      );
+    }
+    if (_lastAcknowledgement != null && _lastAcknowledgedMedication != null) {
+      return _AcknowledgementState(
+        acknowledgement: _lastAcknowledgement!,
+        medication: _lastAcknowledgedMedication!,
+        nextOccurrence: _occurrence,
+        onContinue: _continueAfterAcknowledgement,
+      );
+    }
+    if (_medications.isEmpty || _occurrence == null) {
+      return _PatientEmptyState(onOpenCaregiver: _openCaregiverSetup);
+    }
+    return _NextMedicationView(
+      occurrence: _occurrence!,
+      now: widget.nowProvider(),
+      actionError: _actionError,
+      actionInProgress: _actionInProgress,
+      onTaken: _acknowledge,
+      onSnooze: _snooze,
+    );
+  }
+}
+
+class _NextMedicationView extends StatelessWidget {
+  const _NextMedicationView({
+    required this.occurrence,
+    required this.now,
+    required this.actionError,
+    required this.actionInProgress,
+    required this.onTaken,
+    required this.onSnooze,
+  });
+
+  final MedicationOccurrence occurrence;
+  final DateTime now;
+  final String? actionError;
+  final bool actionInProgress;
+  final VoidCallback onTaken;
+  final VoidCallback onSnooze;
+
+  @override
+  Widget build(BuildContext context) {
+    final snoozedUntil = occurrence.snoozedUntil;
+    final isToday = occurrence.scheduledDate == localDateKey(now);
+    final actionable = occurrence.isActionable(now);
+    final status = snoozedUntil != null
+        ? 'SNOOZED UNTIL ${_formatClock(snoozedUntil)}'
+        : !isToday
+        ? 'NEXT: TOMORROW AT ${occurrence.medication.time}'
+        : occurrence.isDue(now)
+        ? 'REMINDER DUE'
+        : occurrence.isOverdue(now)
+        ? 'REMINDER OVERDUE · SCHEDULED ${occurrence.medication.time}'
+        : 'SCHEDULED FOR ${occurrence.medication.time}';
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.fromLTRB(24, 34, 24, 28),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Text(
+            status,
+            style: const TextStyle(
+              fontSize: 18,
+              fontWeight: FontWeight.bold,
+              color: Color(0xFF1A4B8C),
+              letterSpacing: 0.4,
+            ),
+          ),
+          const SizedBox(height: 18),
+          Container(
+            padding: const EdgeInsets.all(24),
+            decoration: BoxDecoration(
+              color: const Color(0xFFF5F8FC),
+              border: Border.all(color: const Color(0xFF1A4B8C), width: 2),
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Icon(
+                  Icons.medication,
+                  size: 56,
+                  color: Color(0xFF1A4B8C),
+                ),
+                const SizedBox(height: 20),
+                Text(
+                  occurrence.medication.name,
+                  style: const TextStyle(
+                    fontSize: 32,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  occurrence.medication.dosage,
+                  style: const TextStyle(fontSize: 26),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 22),
+          const Text(
+            'Check the medication label before taking it.',
+            style: TextStyle(fontSize: 20, height: 1.35),
+          ),
+          if (actionError != null) ...[
+            const SizedBox(height: 18),
+            Text(
+              actionError!,
+              style: const TextStyle(
+                color: Colors.red,
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ],
+          if (actionable) ...[
+            const SizedBox(height: 30),
+            ElevatedButton.icon(
+              onPressed: actionInProgress ? null : onTaken,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF1A4B8C),
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 20),
+              ),
+              icon: const Icon(Icons.check_circle_outline, size: 30),
+              label: const Text(
+                'I’ve taken it',
+                style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+              ),
+            ),
+            if (snoozedUntil == null) ...[
+              const SizedBox(height: 14),
+              OutlinedButton.icon(
+                onPressed: actionInProgress ? null : onSnooze,
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: const Color(0xFF1A4B8C),
+                  side: const BorderSide(color: Color(0xFF1A4B8C), width: 2),
+                  padding: const EdgeInsets.symmetric(vertical: 20),
+                ),
+                icon: const Icon(Icons.snooze, size: 30),
+                label: const Text(
+                  'Remind me in 10 minutes',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                ),
+              ),
+            ],
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _AcknowledgementState extends StatelessWidget {
+  const _AcknowledgementState({
+    required this.acknowledgement,
+    required this.medication,
+    required this.nextOccurrence,
+    required this.onContinue,
+  });
+
+  final MedicationAcknowledgement acknowledgement;
+  final Medication medication;
+  final MedicationOccurrence? nextOccurrence;
+  final VoidCallback onContinue;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(28),
+        child: Column(
+          children: [
+            const Icon(
+              Icons.check_circle_outline,
+              size: 96,
+              color: Color(0xFF1A4B8C),
+            ),
+            const SizedBox(height: 24),
+            const Text(
+              'Marked as taken',
+              style: TextStyle(fontSize: 30, fontWeight: FontWeight.bold),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 16),
+            Text(
+              '${medication.name} · ${medication.dosage}\n${_formatClock(acknowledgement.acknowledgedAt)}',
+              style: const TextStyle(fontSize: 21, height: 1.45),
+              textAlign: TextAlign.center,
+            ),
+            if (nextOccurrence != null) ...[
+              const SizedBox(height: 30),
+              const Divider(),
+              const SizedBox(height: 18),
+              const Text(
+                'Next reminder',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                '${nextOccurrence!.medication.name} · ${nextOccurrence!.medication.time}',
+                style: const TextStyle(fontSize: 20),
+              ),
+            ],
+            const SizedBox(height: 34),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                onPressed: onContinue,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF1A4B8C),
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 18),
+                ),
+                child: const Text('Continue'),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _PatientEmptyState extends StatelessWidget {
+  const _PatientEmptyState({required this.onOpenCaregiver});
+
+  final VoidCallback onOpenCaregiver;
+
+  @override
+  Widget build(BuildContext context) {
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(32),
@@ -241,46 +646,400 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             const SizedBox(height: 28),
             const Text(
-              'No medications yet',
+              'No medications set up',
               style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold),
               textAlign: TextAlign.center,
             ),
-            const SizedBox(height: 16),
+            const SizedBox(height: 14),
             const Text(
-              'Tap "Add Medication" below\nto add your first one.',
-              style: TextStyle(fontSize: 20, color: Colors.black54, height: 1.5),
+              'A caregiver can add the first medication and reminder.',
+              style: TextStyle(fontSize: 20, color: Colors.black54),
               textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 28),
+            ElevatedButton(
+              onPressed: onOpenCaregiver,
+              child: const Text('Open caregiver setup'),
             ),
           ],
         ),
       ),
     );
   }
+}
 
-  /// The scrollable list of medication cards.
-  Widget _buildMedicationList() {
+class _StorageUnavailableState extends StatelessWidget {
+  const _StorageUnavailableState({
+    required this.message,
+    required this.onRetry,
+    required this.onOpenCaregiver,
+  });
+
+  final String message;
+  final VoidCallback onRetry;
+  final VoidCallback onOpenCaregiver;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(30),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.error_outline, size: 72, color: Colors.red),
+            const SizedBox(height: 20),
+            Text(
+              message,
+              style: const TextStyle(fontSize: 20),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 26),
+            ElevatedButton(onPressed: onRetry, child: const Text('Try again')),
+            TextButton(
+              onPressed: onOpenCaregiver,
+              child: const Text('Open caregiver setup'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _MessageBanner extends StatelessWidget {
+  const _MessageBanner({
+    required this.message,
+    required this.icon,
+    required this.onDismiss,
+    this.actionLabel,
+    this.onAction,
+  });
+
+  final String message;
+  final IconData icon;
+  final VoidCallback onDismiss;
+  final String? actionLabel;
+  final VoidCallback? onAction;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: const Color(0xFFFFF4D6),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 12, 8, 12),
+        child: Row(
+          children: [
+            Icon(icon, color: const Color(0xFF765000)),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                message,
+                style: const TextStyle(fontSize: 16, height: 1.3),
+              ),
+            ),
+            if (actionLabel != null && onAction != null)
+              TextButton(onPressed: onAction, child: Text(actionLabel!)),
+            IconButton(
+              onPressed: onDismiss,
+              tooltip: 'Dismiss message',
+              icon: const Icon(Icons.close),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class CaregiverScheduleScreen extends StatefulWidget {
+  const CaregiverScheduleScreen({super.key});
+
+  @override
+  State<CaregiverScheduleScreen> createState() =>
+      _CaregiverScheduleScreenState();
+}
+
+class _CaregiverScheduleScreenState extends State<CaregiverScheduleScreen> {
+  List<Medication> _medications = [];
+  bool _isLoading = true;
+  String? _error;
+  String? _warning;
+  Medication? _medicationNeedingReminderRetry;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    try {
+      final loadResult = await MedicationStorage.loadWithMetadata();
+      final medications = loadResult.medications;
+      if (loadResult.migrated) {
+        await NotificationService.instance.reconcileMedicationReminders(
+          medications,
+        );
+      }
+      final reminderRetries = await ReminderRetryStorage.load();
+      Medication? retryMedication;
+      for (final medication in medications) {
+        if (reminderRetries.contains(medication.id)) {
+          retryMedication = medication;
+          break;
+        }
+      }
+      if (!mounted) return;
+      setState(() {
+        _medications = medications;
+        _isLoading = false;
+        _error = null;
+        if (retryMedication != null) {
+          _warning =
+              'The reminder for ${retryMedication.name} needs to be scheduled.';
+          _medicationNeedingReminderRetry = retryMedication;
+        }
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _isLoading = false;
+        _error =
+            'Medication data is unavailable. Retry before changing the schedule.';
+      });
+    }
+  }
+
+  Future<void> _openAddForm() async {
+    final newMedication = await Navigator.push<Medication>(
+      context,
+      MaterialPageRoute(builder: (_) => const AddMedicationScreen()),
+    );
+    if (newMedication == null || !mounted) return;
+
+    final updated = [..._medications, newMedication];
+    try {
+      await MedicationStorage.save(updated);
+      if (mounted) setState(() => _medications = updated);
+      try {
+        await NotificationService.instance.scheduleDailyMedicationReminder(
+          id: newMedication.id,
+          medicationName: newMedication.name,
+          dosage: newMedication.dosage,
+          hour: newMedication.hour,
+          minute: newMedication.minute,
+        );
+        await ReminderRetryStorage.remove(newMedication.id);
+      } catch (_) {
+        try {
+          await ReminderRetryStorage.add(newMedication.id);
+        } catch (_) {
+          // The current screen warning remains the fallback for this session.
+        }
+        if (mounted) {
+          setState(() {
+            _warning =
+                'Medication saved, but its reminder could not be scheduled.';
+            _medicationNeedingReminderRetry = newMedication;
+          });
+        }
+      }
+    } catch (_) {
+      if (!mounted) return;
+      setState(
+        () => _warning =
+            'The medication could not be saved. No reminder was added.',
+      );
+    }
+  }
+
+  Future<void> _retryReminder() async {
+    final medication = _medicationNeedingReminderRetry;
+    if (medication == null) return;
+    try {
+      await NotificationService.instance.scheduleDailyMedicationReminder(
+        id: medication.id,
+        medicationName: medication.name,
+        dosage: medication.dosage,
+        hour: medication.hour,
+        minute: medication.minute,
+      );
+      await ReminderRetryStorage.remove(medication.id);
+      if (!mounted) return;
+      setState(() {
+        _warning = null;
+        _medicationNeedingReminderRetry = null;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(
+        () => _warning =
+            'The reminder still could not be scheduled. Check Android permissions and try again.',
+      );
+    }
+  }
+
+  Future<void> _deleteMedication(int index) async {
+    final medication = _medications[index];
+    final confirmed =
+        await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('Delete medication?'),
+            content: Text(
+              'Delete ${medication.name} and cancel its reminders?',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Keep medication'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                style: FilledButton.styleFrom(backgroundColor: Colors.red),
+                child: const Text('Delete'),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+    if (!confirmed || !mounted) return;
+
+    final updated = [..._medications]..removeAt(index);
+    try {
+      await MedicationStorage.save(updated);
+      if (mounted) setState(() => _medications = updated);
+      try {
+        await ReminderRetryStorage.remove(medication.id);
+      } catch (_) {
+        // Deletion remains authoritative even if retry metadata cleanup fails.
+      }
+      try {
+        await MedicationStateStorage.clearAllSnoozesForMedication(
+          medication.id,
+        );
+      } catch (_) {
+        if (mounted) {
+          setState(
+            () => _warning =
+                'The medication was deleted, but old snooze data could not be cleared.',
+          );
+        }
+      }
+      final cancelled = await NotificationService.instance
+          .cancelAllForMedication(medication.id);
+      if (!cancelled && mounted) {
+        setState(
+          () => _warning =
+              'The medication was deleted, but an old reminder may still appear. Cancellation will be retried.',
+        );
+      }
+    } catch (_) {
+      if (!mounted) return;
+      setState(
+        () =>
+            _warning = 'The medication could not be deleted. Please try again.',
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.white,
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF1A4B8C),
+        foregroundColor: Colors.white,
+        title: const Text(
+          'Medication Schedule',
+          style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+        ),
+      ),
+      body: Column(
+        children: [
+          if (_warning != null)
+            _MessageBanner(
+              message: _warning!,
+              icon: Icons.warning_amber,
+              actionLabel: _medicationNeedingReminderRetry == null
+                  ? null
+                  : 'Retry',
+              onAction: _medicationNeedingReminderRetry == null
+                  ? null
+                  : _retryReminder,
+              onDismiss: () => setState(() {
+                _warning = null;
+                _medicationNeedingReminderRetry = null;
+              }),
+            ),
+          Expanded(child: _buildBody()),
+        ],
+      ),
+      floatingActionButton: _error == null && !_isLoading
+          ? FloatingActionButton.extended(
+              onPressed: _openAddForm,
+              backgroundColor: const Color(0xFF1A4B8C),
+              foregroundColor: Colors.white,
+              icon: const Icon(Icons.add, size: 30),
+              label: const Text(
+                'Add Medication',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+            )
+          : null,
+    );
+  }
+
+  Widget _buildBody() {
+    if (_isLoading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_error != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(30),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Text(
+                _error!,
+                style: const TextStyle(fontSize: 20),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 20),
+              ElevatedButton(onPressed: _load, child: const Text('Try again')),
+            ],
+          ),
+        ),
+      );
+    }
     return ListView.separated(
-      padding: const EdgeInsets.fromLTRB(16, 20, 16, 100), // bottom padding clears the FAB
-      itemCount: _medications.length,
+      padding: const EdgeInsets.fromLTRB(16, 20, 16, 110),
+      itemCount: _medications.length + 1,
       separatorBuilder: (_, _) => const SizedBox(height: 14),
       itemBuilder: (context, index) {
+        if (index == 0) {
+          return const Padding(
+            padding: EdgeInsets.fromLTRB(4, 0, 4, 8),
+            child: Text(
+              'Set reminders using the medication label or instructions from a healthcare professional.',
+              style: TextStyle(fontSize: 18, height: 1.4),
+            ),
+          );
+        }
+        final medicationIndex = index - 1;
         return _MedicationCard(
-          medication: _medications[index],
-          onDelete: () => _deleteMedication(index),
+          medication: _medications[medicationIndex],
+          onDelete: () => _deleteMedication(medicationIndex),
         );
       },
     );
   }
 }
 
-// ─── Medication Card ───────────────────────────────────────────────────────
-
-/// A single card in the medication list showing name, dosage, and time.
 class _MedicationCard extends StatelessWidget {
-  const _MedicationCard({
-    required this.medication,
-    required this.onDelete,
-  });
+  const _MedicationCard({required this.medication, required this.onDelete});
 
   final Medication medication;
   final VoidCallback onDelete;
@@ -288,13 +1047,12 @@ class _MedicationCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Card(
-      elevation: 3,
+      elevation: 2,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 18),
         child: Row(
           children: [
-            // Blue icon badge on the left
             Container(
               padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
@@ -308,7 +1066,6 @@ class _MedicationCard extends StatelessWidget {
               ),
             ),
             const SizedBox(width: 16),
-            // Medication details in the middle
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -316,34 +1073,28 @@ class _MedicationCard extends StatelessWidget {
                   Text(
                     medication.name,
                     style: const TextStyle(
-                        fontSize: 22, fontWeight: FontWeight.bold),
+                      fontSize: 22,
+                      fontWeight: FontWeight.bold,
+                    ),
                   ),
+                  const SizedBox(height: 6),
+                  Text(medication.dosage, style: const TextStyle(fontSize: 18)),
                   const SizedBox(height: 6),
                   Text(
-                    medication.dosage,
-                    style: const TextStyle(fontSize: 18, color: Colors.black87),
-                  ),
-                  const SizedBox(height: 6),
-                  Row(
-                    children: [
-                      const Icon(Icons.access_time,
-                          size: 18, color: Colors.black54),
-                      const SizedBox(width: 4),
-                      Text(
-                        medication.time,
-                        style: const TextStyle(
-                            fontSize: 18, color: Colors.black54),
-                      ),
-                    ],
+                    medication.time,
+                    style: const TextStyle(fontSize: 18, color: Colors.black54),
                   ),
                 ],
               ),
             ),
-            // Delete button on the right — large tap target
             IconButton(
               onPressed: onDelete,
-              icon: const Icon(Icons.delete_outline, color: Colors.red, size: 30),
-              tooltip: 'Delete',
+              icon: const Icon(
+                Icons.delete_outline,
+                color: Colors.red,
+                size: 30,
+              ),
+              tooltip: 'Delete ${medication.name}',
               padding: const EdgeInsets.all(12),
             ),
           ],
@@ -353,9 +1104,6 @@ class _MedicationCard extends StatelessWidget {
   }
 }
 
-// ─── Add Medication Screen ─────────────────────────────────────────────────
-
-/// A form screen for entering a new medication.
 class AddMedicationScreen extends StatefulWidget {
   const AddMedicationScreen({super.key});
 
@@ -364,44 +1112,28 @@ class AddMedicationScreen extends StatefulWidget {
 }
 
 class _AddMedicationScreenState extends State<AddMedicationScreen> {
-  // The form key lets us validate all fields at once when the user taps Save.
   final _formKey = GlobalKey<FormState>();
-
   final _nameController = TextEditingController();
   final _dosageController = TextEditingController();
-
-  // Null until the user picks a time from the time picker.
   TimeOfDay? _selectedTime;
+  bool _isPreparing = false;
 
   @override
   void dispose() {
-    // Free up memory when this screen is closed.
     _nameController.dispose();
     _dosageController.dispose();
     super.dispose();
   }
 
-  /// Open the built-in system time picker dialog.
   Future<void> _pickTime() async {
     final picked = await showTimePicker(
       context: context,
       initialTime: _selectedTime ?? TimeOfDay.now(),
-      helpText: 'Select time to take medication',
-      builder: (context, child) {
-        // Make the time picker's own text a bit larger too.
-        return MediaQuery(
-          data: MediaQuery.of(context)
-              .copyWith(textScaler: const TextScaler.linear(1.2)),
-          child: child!,
-        );
-      },
+      helpText: 'Select medication reminder time',
     );
-    if (picked != null) {
-      setState(() => _selectedTime = picked);
-    }
+    if (picked != null && mounted) setState(() => _selectedTime = picked);
   }
 
-  /// Convert a TimeOfDay to a human-friendly string like "8:30 AM".
   String _formatTime(TimeOfDay time) {
     final hour = time.hourOfPeriod == 0 ? 12 : time.hourOfPeriod;
     final minute = time.minute.toString().padLeft(2, '0');
@@ -409,37 +1141,40 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
     return '$hour:$minute $period';
   }
 
-  /// Validate the form; if everything looks good, pop back to HomeScreen
-  /// and pass the new Medication as the result.
-  void _save() {
-    // _formKey.currentState!.validate() checks each field's validator function.
+  Future<void> _save() async {
     if (!_formKey.currentState!.validate()) return;
-
     if (_selectedTime == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Please select a time.', style: TextStyle(fontSize: 18)),
-          backgroundColor: Colors.red,
-        ),
+        const SnackBar(content: Text('Please select a reminder time.')),
       );
       return;
     }
 
-    // Send the new medication back to HomeScreen.
-    Navigator.pop(
-      context,
-      Medication(
-        // Android notification ids must fit in a 32-bit int, so we can't
-        // use the full millisecondsSinceEpoch value directly — this keeps
-        // it small while still being unique enough for a simple app.
-        id: DateTime.now().millisecondsSinceEpoch.remainder(1000000000),
-        name: _nameController.text.trim(),
-        dosage: _dosageController.text.trim(),
-        time: _formatTime(_selectedTime!),
-        hour: _selectedTime!.hour,
-        minute: _selectedTime!.minute,
-      ),
-    );
+    setState(() => _isPreparing = true);
+    try {
+      final id = await MedicationStorage.createId();
+      if (!mounted) return;
+      Navigator.pop(
+        context,
+        Medication(
+          id: id,
+          name: _nameController.text.trim(),
+          dosage: _dosageController.text.trim(),
+          time: _formatTime(_selectedTime!),
+          hour: _selectedTime!.hour,
+          minute: _selectedTime!.minute,
+        ),
+      );
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _isPreparing = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('The medication could not be prepared. Try again.'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
   }
 
   @override
@@ -454,7 +1189,6 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
           style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
         ),
       ),
-      // SingleChildScrollView lets the page scroll if the keyboard pushes it up.
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(24),
         child: Form(
@@ -462,8 +1196,6 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-
-              // ── Medication Name ──────────────────────────────────────────
               const Text(
                 'Medication Name',
                 style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
@@ -477,16 +1209,11 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
                   hintText: 'e.g. Lisinopril',
                   prefixIcon: Icon(Icons.medication, size: 28),
                 ),
-                validator: (value) {
-                  if (value == null || value.trim().isEmpty) {
-                    return 'Please enter the medication name.';
-                  }
-                  return null; // null means "no error"
-                },
+                validator: (value) => value == null || value.trim().isEmpty
+                    ? 'Please enter the medication name.'
+                    : null,
               ),
               const SizedBox(height: 28),
-
-              // ── Dosage ───────────────────────────────────────────────────
               const Text(
                 'Dosage',
                 style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
@@ -496,78 +1223,90 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
                 controller: _dosageController,
                 style: const TextStyle(fontSize: 20),
                 decoration: const InputDecoration(
-                  hintText: 'e.g. 500 mg',
+                  hintText: 'e.g. 10 mg',
                   prefixIcon: Icon(Icons.scale, size: 28),
                 ),
-                validator: (value) {
-                  if (value == null || value.trim().isEmpty) {
-                    return 'Please enter the dosage.';
-                  }
-                  return null;
-                },
+                validator: (value) => value == null || value.trim().isEmpty
+                    ? 'Please enter the dosage.'
+                    : null,
               ),
               const SizedBox(height: 28),
-
-              // ── Time ─────────────────────────────────────────────────────
               const Text(
-                'Time to Take',
+                'Reminder Time',
                 style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
               ),
               const SizedBox(height: 10),
-              // We use a GestureDetector + Container to make a tappable box
-              // that looks like a form field but opens the time picker.
-              GestureDetector(
-                onTap: _pickTime,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 16, vertical: 20),
-                  decoration: BoxDecoration(
-                    border: Border.all(color: Colors.black54),
-                    borderRadius: BorderRadius.circular(4),
-                  ),
-                  child: Row(
-                    children: [
-                      const Icon(Icons.access_time,
-                          size: 28, color: Colors.black54),
-                      const SizedBox(width: 12),
-                      Text(
-                        _selectedTime == null
-                            ? 'Tap to select a time'
-                            : _formatTime(_selectedTime!),
-                        style: TextStyle(
-                          fontSize: 20,
-                          color: _selectedTime == null
-                              ? Colors.black45
-                              : Colors.black87,
+              Semantics(
+                button: true,
+                label: _selectedTime == null
+                    ? 'Select reminder time'
+                    : 'Reminder time ${_formatTime(_selectedTime!)}',
+                child: InkWell(
+                  onTap: _pickTime,
+                  borderRadius: BorderRadius.circular(4),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 20,
+                    ),
+                    decoration: BoxDecoration(
+                      border: Border.all(color: Colors.black54),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(
+                          Icons.access_time,
+                          size: 28,
+                          color: Colors.black54,
                         ),
-                      ),
-                    ],
+                        const SizedBox(width: 12),
+                        Text(
+                          _selectedTime == null
+                              ? 'Tap to select a time'
+                              : _formatTime(_selectedTime!),
+                          style: TextStyle(
+                            fontSize: 20,
+                            color: _selectedTime == null
+                                ? Colors.black54
+                                : Colors.black87,
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
               ),
               const SizedBox(height: 44),
-
-              // ── Save Button ───────────────────────────────────────────────
               ElevatedButton.icon(
-                onPressed: _save,
+                onPressed: _isPreparing ? null : _save,
                 style: ElevatedButton.styleFrom(
                   backgroundColor: const Color(0xFF1A4B8C),
                   foregroundColor: Colors.white,
                   padding: const EdgeInsets.symmetric(vertical: 20),
-                  shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12)),
                 ),
-                icon: const Icon(Icons.save, size: 28),
+                icon: _isPreparing
+                    ? const SizedBox(
+                        width: 24,
+                        height: 24,
+                        child: CircularProgressIndicator(strokeWidth: 3),
+                      )
+                    : const Icon(Icons.save, size: 28),
                 label: const Text(
                   'Save Medication',
                   style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
                 ),
               ),
-
             ],
           ),
         ),
       ),
     );
   }
+}
+
+String _formatClock(DateTime value) {
+  final hour = value.hour % 12 == 0 ? 12 : value.hour % 12;
+  final minute = value.minute.toString().padLeft(2, '0');
+  return '$hour:$minute ${value.hour < 12 ? 'AM' : 'PM'}';
 }
