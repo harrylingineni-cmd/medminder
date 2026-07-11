@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(flutter pub *)",
+      "Skill(run)",
+      "Bash(flutter run *)",
+      "Bash(flutter --version)",
+      "Bash(flutter config *)",
+      "Bash(flutter analyze *)",
+      "Bash(grep -n 'Future<void> cancel' -A 10 __TRACKED_VAR__/lib/src/flutter_local_notifications_plugin.dart)",
+      "Bash(flutter build *)"
+    ]
+  }
+}

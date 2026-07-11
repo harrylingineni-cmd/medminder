@@ -1,0 +1,573 @@
+import 'dart:convert'; // For turning our data into text so it can be saved
+import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart'; // For local storage
+import 'notification_service.dart'; // Schedules the medication reminders
+
+// ─── App Entry Point ───────────────────────────────────────────────────────
+
+void main() async {
+  // This line is required before using SharedPreferences.
+  // It makes sure Flutter is fully set up before we touch storage.
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Set up the notification plugin and ask for the permissions we need
+  // (showing notifications, and scheduling them at an exact time) before
+  // the user even opens the Add Medication screen.
+  await NotificationService.instance.init();
+  await NotificationService.instance.requestPermissions();
+
+  runApp(const MedTrackerApp());
+}
+
+// ─── Data Model ────────────────────────────────────────────────────────────
+
+/// Represents one medication the user wants to track.
+class Medication {
+  final int id; // Also used as the notification id for this medication.
+  final String name;
+  final String dosage;
+  final String time; // Displayed as "8:30 AM"
+  final int hour; // 24-hour hour (0-23), used to schedule the reminder.
+  final int minute; // 0-59, used to schedule the reminder.
+
+  Medication({
+    required this.id,
+    required this.name,
+    required this.dosage,
+    required this.time,
+    required this.hour,
+    required this.minute,
+  });
+
+  /// Turn this medication into a Map so it can be saved as JSON text.
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'dosage': dosage,
+        'time': time,
+        'hour': hour,
+        'minute': minute,
+      };
+
+  /// Recreate a Medication from a Map that was loaded out of storage.
+  factory Medication.fromJson(Map<String, dynamic> json) => Medication(
+        // Older saved medications (from before reminders were added) won't
+        // have an id/hour/minute yet, so fall back to sensible defaults
+        // rather than crashing.
+        id: json['id'] as int? ??
+            DateTime.now().millisecondsSinceEpoch.remainder(1000000000),
+        name: json['name'] as String,
+        dosage: json['dosage'] as String,
+        time: json['time'] as String,
+        hour: json['hour'] as int? ?? 8,
+        minute: json['minute'] as int? ?? 0,
+      );
+}
+
+// ─── Storage Helper ────────────────────────────────────────────────────────
+
+/// All the code for reading and writing medications to the device lives here.
+///
+/// SharedPreferences stores simple key→value pairs on the device.
+/// Because it can only store strings, we convert each Medication to a JSON
+/// string before saving, and parse it back when loading.
+class MedicationStorage {
+  // The key used to look up our list inside SharedPreferences.
+  static const _storageKey = 'medications';
+
+  /// Load all saved medications from the device.
+  /// Returns an empty list if nothing has been saved yet.
+  static Future<List<Medication>> load() async {
+    final prefs = await SharedPreferences.getInstance();
+    // getStringList returns null if the key doesn't exist yet, so we use ?? []
+    final jsonStrings = prefs.getStringList(_storageKey) ?? [];
+    return jsonStrings
+        .map((s) => Medication.fromJson(jsonDecode(s) as Map<String, dynamic>))
+        .toList();
+  }
+
+  /// Save the full list of medications to the device, replacing the old list.
+  static Future<void> save(List<Medication> medications) async {
+    final prefs = await SharedPreferences.getInstance();
+    final jsonStrings =
+        medications.map((m) => jsonEncode(m.toJson())).toList();
+    await prefs.setStringList(_storageKey, jsonStrings);
+  }
+}
+
+// ─── App Root ──────────────────────────────────────────────────────────────
+
+/// The root of the app. Sets up the overall look and feel.
+class MedTrackerApp extends StatelessWidget {
+  const MedTrackerApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'My Medications',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF1A4B8C), // deep blue
+        ),
+        // ── Larger text throughout the whole app ──
+        textTheme: const TextTheme(
+          bodyLarge: TextStyle(fontSize: 20),
+          bodyMedium: TextStyle(fontSize: 18),
+          titleLarge: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+          labelLarge: TextStyle(fontSize: 18), // text inside buttons
+        ),
+        // ── Taller form fields so they are easy to tap ──
+        inputDecorationTheme: const InputDecorationTheme(
+          contentPadding:
+              EdgeInsets.symmetric(horizontal: 16, vertical: 20),
+          border: OutlineInputBorder(),
+        ),
+        useMaterial3: true,
+      ),
+      home: const HomeScreen(),
+    );
+  }
+}
+
+// ─── Home Screen ───────────────────────────────────────────────────────────
+
+/// The main screen showing the list of medications.
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  List<Medication> _medications = [];
+  bool _isLoading = true; // True while we are reading from storage
+
+  @override
+  void initState() {
+    super.initState();
+    // Load saved medications as soon as the screen appears.
+    _loadMedications();
+  }
+
+  Future<void> _loadMedications() async {
+    final loaded = await MedicationStorage.load();
+    setState(() {
+      _medications = loaded;
+      _isLoading = false;
+    });
+  }
+
+  /// Navigate to the Add Medication screen and wait for the result.
+  Future<void> _openAddForm() async {
+    // Navigator.push opens a new screen. When that screen calls Navigator.pop
+    // with a Medication object, it is returned here as `newMed`.
+    final newMed = await Navigator.push<Medication>(
+      context,
+      MaterialPageRoute(builder: (_) => const AddMedicationScreen()),
+    );
+    // If the user tapped Save (not Cancel), add the new medication.
+    if (newMed != null) {
+      final updated = [..._medications, newMed];
+      setState(() => _medications = updated);
+      await MedicationStorage.save(updated); // Persist to device storage
+
+      // Schedule a daily reminder that fires at this medication's time.
+      await NotificationService.instance.scheduleDailyMedicationReminder(
+        id: newMed.id,
+        medicationName: newMed.name,
+        dosage: newMed.dosage,
+        hour: newMed.hour,
+        minute: newMed.minute,
+      );
+    }
+  }
+
+  /// Remove the medication at [index] from the list, save, and stop its
+  /// reminder notification.
+  Future<void> _deleteMedication(int index) async {
+    final removed = _medications[index];
+    final updated = [..._medications]..removeAt(index);
+    setState(() => _medications = updated);
+    await MedicationStorage.save(updated);
+    await NotificationService.instance.cancel(removed.id);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.white,
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF1A4B8C), // deep blue = high contrast
+        foregroundColor: Colors.white,
+        title: const Text(
+          'My Medications',
+          style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold),
+        ),
+      ),
+      // Show a spinner, the empty state, or the list depending on app state.
+      body: _isLoading
+          ? const Center(child: CircularProgressIndicator())
+          : _medications.isEmpty
+              ? _buildEmptyState()
+              : _buildMedicationList(),
+      // A large, labelled button so the action is obvious.
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: _openAddForm,
+        backgroundColor: const Color(0xFF1A4B8C),
+        foregroundColor: Colors.white,
+        icon: const Icon(Icons.add, size: 30),
+        label: const Text(
+          'Add Medication',
+          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+        ),
+      ),
+    );
+  }
+
+  /// Friendly message shown when the list is empty.
+  Widget _buildEmptyState() {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              Icons.medication_outlined,
+              size: 90,
+              color: Colors.blue.shade200,
+            ),
+            const SizedBox(height: 28),
+            const Text(
+              'No medications yet',
+              style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 16),
+            const Text(
+              'Tap "Add Medication" below\nto add your first one.',
+              style: TextStyle(fontSize: 20, color: Colors.black54, height: 1.5),
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// The scrollable list of medication cards.
+  Widget _buildMedicationList() {
+    return ListView.separated(
+      padding: const EdgeInsets.fromLTRB(16, 20, 16, 100), // bottom padding clears the FAB
+      itemCount: _medications.length,
+      separatorBuilder: (_, _) => const SizedBox(height: 14),
+      itemBuilder: (context, index) {
+        return _MedicationCard(
+          medication: _medications[index],
+          onDelete: () => _deleteMedication(index),
+        );
+      },
+    );
+  }
+}
+
+// ─── Medication Card ───────────────────────────────────────────────────────
+
+/// A single card in the medication list showing name, dosage, and time.
+class _MedicationCard extends StatelessWidget {
+  const _MedicationCard({
+    required this.medication,
+    required this.onDelete,
+  });
+
+  final Medication medication;
+  final VoidCallback onDelete;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      elevation: 3,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 18),
+        child: Row(
+          children: [
+            // Blue icon badge on the left
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: const Color(0xFFE3EBF8),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: const Icon(
+                Icons.medication,
+                color: Color(0xFF1A4B8C),
+                size: 36,
+              ),
+            ),
+            const SizedBox(width: 16),
+            // Medication details in the middle
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    medication.name,
+                    style: const TextStyle(
+                        fontSize: 22, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    medication.dosage,
+                    style: const TextStyle(fontSize: 18, color: Colors.black87),
+                  ),
+                  const SizedBox(height: 6),
+                  Row(
+                    children: [
+                      const Icon(Icons.access_time,
+                          size: 18, color: Colors.black54),
+                      const SizedBox(width: 4),
+                      Text(
+                        medication.time,
+                        style: const TextStyle(
+                            fontSize: 18, color: Colors.black54),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            // Delete button on the right — large tap target
+            IconButton(
+              onPressed: onDelete,
+              icon: const Icon(Icons.delete_outline, color: Colors.red, size: 30),
+              tooltip: 'Delete',
+              padding: const EdgeInsets.all(12),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ─── Add Medication Screen ─────────────────────────────────────────────────
+
+/// A form screen for entering a new medication.
+class AddMedicationScreen extends StatefulWidget {
+  const AddMedicationScreen({super.key});
+
+  @override
+  State<AddMedicationScreen> createState() => _AddMedicationScreenState();
+}
+
+class _AddMedicationScreenState extends State<AddMedicationScreen> {
+  // The form key lets us validate all fields at once when the user taps Save.
+  final _formKey = GlobalKey<FormState>();
+
+  final _nameController = TextEditingController();
+  final _dosageController = TextEditingController();
+
+  // Null until the user picks a time from the time picker.
+  TimeOfDay? _selectedTime;
+
+  @override
+  void dispose() {
+    // Free up memory when this screen is closed.
+    _nameController.dispose();
+    _dosageController.dispose();
+    super.dispose();
+  }
+
+  /// Open the built-in system time picker dialog.
+  Future<void> _pickTime() async {
+    final picked = await showTimePicker(
+      context: context,
+      initialTime: _selectedTime ?? TimeOfDay.now(),
+      helpText: 'Select time to take medication',
+      builder: (context, child) {
+        // Make the time picker's own text a bit larger too.
+        return MediaQuery(
+          data: MediaQuery.of(context)
+              .copyWith(textScaler: const TextScaler.linear(1.2)),
+          child: child!,
+        );
+      },
+    );
+    if (picked != null) {
+      setState(() => _selectedTime = picked);
+    }
+  }
+
+  /// Convert a TimeOfDay to a human-friendly string like "8:30 AM".
+  String _formatTime(TimeOfDay time) {
+    final hour = time.hourOfPeriod == 0 ? 12 : time.hourOfPeriod;
+    final minute = time.minute.toString().padLeft(2, '0');
+    final period = time.period == DayPeriod.am ? 'AM' : 'PM';
+    return '$hour:$minute $period';
+  }
+
+  /// Validate the form; if everything looks good, pop back to HomeScreen
+  /// and pass the new Medication as the result.
+  void _save() {
+    // _formKey.currentState!.validate() checks each field's validator function.
+    if (!_formKey.currentState!.validate()) return;
+
+    if (_selectedTime == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Please select a time.', style: TextStyle(fontSize: 18)),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return;
+    }
+
+    // Send the new medication back to HomeScreen.
+    Navigator.pop(
+      context,
+      Medication(
+        // Android notification ids must fit in a 32-bit int, so we can't
+        // use the full millisecondsSinceEpoch value directly — this keeps
+        // it small while still being unique enough for a simple app.
+        id: DateTime.now().millisecondsSinceEpoch.remainder(1000000000),
+        name: _nameController.text.trim(),
+        dosage: _dosageController.text.trim(),
+        time: _formatTime(_selectedTime!),
+        hour: _selectedTime!.hour,
+        minute: _selectedTime!.minute,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.white,
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF1A4B8C),
+        foregroundColor: Colors.white,
+        title: const Text(
+          'Add Medication',
+          style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+        ),
+      ),
+      // SingleChildScrollView lets the page scroll if the keyboard pushes it up.
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(24),
+        child: Form(
+          key: _formKey,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+
+              // ── Medication Name ──────────────────────────────────────────
+              const Text(
+                'Medication Name',
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 10),
+              TextFormField(
+                controller: _nameController,
+                style: const TextStyle(fontSize: 20),
+                textCapitalization: TextCapitalization.words,
+                decoration: const InputDecoration(
+                  hintText: 'e.g. Lisinopril',
+                  prefixIcon: Icon(Icons.medication, size: 28),
+                ),
+                validator: (value) {
+                  if (value == null || value.trim().isEmpty) {
+                    return 'Please enter the medication name.';
+                  }
+                  return null; // null means "no error"
+                },
+              ),
+              const SizedBox(height: 28),
+
+              // ── Dosage ───────────────────────────────────────────────────
+              const Text(
+                'Dosage',
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 10),
+              TextFormField(
+                controller: _dosageController,
+                style: const TextStyle(fontSize: 20),
+                decoration: const InputDecoration(
+                  hintText: 'e.g. 500 mg',
+                  prefixIcon: Icon(Icons.scale, size: 28),
+                ),
+                validator: (value) {
+                  if (value == null || value.trim().isEmpty) {
+                    return 'Please enter the dosage.';
+                  }
+                  return null;
+                },
+              ),
+              const SizedBox(height: 28),
+
+              // ── Time ─────────────────────────────────────────────────────
+              const Text(
+                'Time to Take',
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 10),
+              // We use a GestureDetector + Container to make a tappable box
+              // that looks like a form field but opens the time picker.
+              GestureDetector(
+                onTap: _pickTime,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 16, vertical: 20),
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Colors.black54),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.access_time,
+                          size: 28, color: Colors.black54),
+                      const SizedBox(width: 12),
+                      Text(
+                        _selectedTime == null
+                            ? 'Tap to select a time'
+                            : _formatTime(_selectedTime!),
+                        style: TextStyle(
+                          fontSize: 20,
+                          color: _selectedTime == null
+                              ? Colors.black45
+                              : Colors.black87,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 44),
+
+              // ── Save Button ───────────────────────────────────────────────
+              ElevatedButton.icon(
+                onPressed: _save,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF1A4B8C),
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 20),
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12)),
+                ),
+                icon: const Icon(Icons.save, size: 28),
+                label: const Text(
+                  'Save Medication',
+                  style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+                ),
+              ),
+
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
