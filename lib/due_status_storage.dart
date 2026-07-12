@@ -26,7 +26,7 @@ class DueStatusEntry {
   final String? takenDate; // e.g. "2026-07-12", or null if never taken.
   final int? snoozeUntilMillis; // epoch millis, or null if not snoozed.
 
-  DueStatusEntry({
+  const DueStatusEntry({
     required this.medicationId,
     this.takenDate,
     this.snoozeUntilMillis,
@@ -67,16 +67,17 @@ class DueStatusStorage {
   static Future<void> _saveAll(Map<int, DueStatusEntry> all) async {
     final prefs = await SharedPreferences.getInstance();
     final jsonStrings = all.values.map((e) => jsonEncode(e.toJson())).toList();
-    await prefs.setStringList(_storageKey, jsonStrings);
+    final saved = await prefs.setStringList(_storageKey, jsonStrings);
+    if (!saved) throw StateError('Medication status could not be saved.');
   }
 
   /// Record that [medicationId] was taken today. This clears any snooze,
   /// since the dose has now been dealt with.
-  static Future<void> markTakenToday(int medicationId) async {
+  static Future<void> markTakenToday(int medicationId, {DateTime? when}) async {
     final all = await loadAll();
     all[medicationId] = DueStatusEntry(
       medicationId: medicationId,
-      takenDate: todayString(),
+      takenDate: todayString(when),
       snoozeUntilMillis: null,
     );
     await _saveAll(all);
@@ -92,6 +93,12 @@ class DueStatusStorage {
       takenDate: all[medicationId]?.takenDate,
       snoozeUntilMillis: until.millisecondsSinceEpoch,
     );
+    await _saveAll(all);
+  }
+
+  /// Remove stale taken/snooze state when a medication is deleted.
+  static Future<void> remove(int medicationId) async {
+    final all = (await loadAll())..remove(medicationId);
     await _saveAll(all);
   }
 

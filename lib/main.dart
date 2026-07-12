@@ -6,36 +6,45 @@ import 'package:shared_preferences/shared_preferences.dart'; // For local storag
 import 'due_status_storage.dart'; // Tracks "taken today" / "snoozed" per medication
 import 'notification_service.dart'; // Schedules the medication reminders
 
-import 'package:flutter/material.dart';
-
-import 'medication_state.dart';
-import 'notification_service.dart';
+// ─── App Entry Point ───────────────────────────────────────────────────────
 
 void main() async {
+  // This line is required before using SharedPreferences.
+  // It makes sure Flutter is fully set up before we touch storage.
   WidgetsFlutterBinding.ensureInitialized();
 
-  String? notificationWarning;
+  // Set up the notification plugin and ask for the permissions we need
+  // (showing notifications, and scheduling them at an exact time) before
+  // the user even opens the Add Medication screen.
   try {
     await NotificationService.instance.init();
-    final permissionsGranted = await NotificationService.instance
-        .requestPermissions();
-    if (!permissionsGranted) {
-      notificationWarning =
-          'Notification or exact-alarm access is off. Reminders may not appear on time.';
-    }
+    await NotificationService.instance.requestPermissions();
   } catch (_) {
-    notificationWarning =
-        'Reminders are unavailable right now. You can still review the medication schedule.';
+    // The schedule remains useful even if Android's notification service is
+    // temporarily unavailable. HomeScreen will show a permission warning.
   }
 
-  runApp(MedTrackerApp(initialNotificationWarning: notificationWarning));
+  runApp(const MedTrackerApp());
 }
 
-class MedTrackerApp extends StatelessWidget {
-  const MedTrackerApp({
-    super.key,
-    this.initialNotificationWarning,
-    this.nowProvider = DateTime.now,
+// ─── Data Model ────────────────────────────────────────────────────────────
+
+/// Represents one medication the user wants to track.
+class Medication {
+  final int id; // Also used as the notification id for this medication.
+  final String name;
+  final String dosage;
+  final String time; // Displayed as "8:30 AM"
+  final int hour; // 24-hour hour (0-23), used to schedule the reminder.
+  final int minute; // 0-59, used to schedule the reminder.
+
+  const Medication({
+    required this.id,
+    required this.name,
+    required this.dosage,
+    required this.time,
+    required this.hour,
+    required this.minute,
   });
 
   /// Turn this medication into a Map so it can be saved as JSON text.
@@ -90,7 +99,8 @@ class MedicationStorage {
   static Future<void> save(List<Medication> medications) async {
     final prefs = await SharedPreferences.getInstance();
     final jsonStrings = medications.map((m) => jsonEncode(m.toJson())).toList();
-    await prefs.setStringList(_storageKey, jsonStrings);
+    final saved = await prefs.setStringList(_storageKey, jsonStrings);
+    if (!saved) throw StateError('Medication data could not be saved.');
   }
 }
 
@@ -103,39 +113,36 @@ class MedTrackerApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'MedMinder',
+      title: 'My Medications',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF1A4B8C)),
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF1A4B8C), // deep blue
+        ),
+        // ── Larger text throughout the whole app ──
         textTheme: const TextTheme(
           bodyLarge: TextStyle(fontSize: 20),
           bodyMedium: TextStyle(fontSize: 18),
           titleLarge: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
-          labelLarge: TextStyle(fontSize: 18),
+          labelLarge: TextStyle(fontSize: 18), // text inside buttons
         ),
+        // ── Taller form fields so they are easy to tap ──
         inputDecorationTheme: const InputDecorationTheme(
           contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 20),
           border: OutlineInputBorder(),
         ),
         useMaterial3: true,
       ),
-      home: HomeScreen(
-        notificationWarning: initialNotificationWarning,
-        nowProvider: nowProvider,
-      ),
+      home: const HomeScreen(),
     );
   }
 }
 
-class HomeScreen extends StatefulWidget {
-  const HomeScreen({
-    super.key,
-    this.notificationWarning,
-    this.nowProvider = DateTime.now,
-  });
+// ─── Home Screen ───────────────────────────────────────────────────────────
 
-  final String? notificationWarning;
-  final DateTime Function() nowProvider;
+/// The main screen showing the list of medications.
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -145,17 +152,7 @@ class HomeScreen extends StatefulWidget {
 // app (e.g. after visiting Settings), via `didChangeAppLifecycleState`.
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   List<Medication> _medications = [];
-  List<MedicationAcknowledgement> _acknowledgements = [];
-  List<MedicationSnooze> _snoozes = [];
-  MedicationOccurrence? _occurrence;
-  MedicationAcknowledgement? _lastAcknowledgement;
-  Medication? _lastAcknowledgedMedication;
-  Timer? _refreshTimer;
-  bool _isLoading = true;
-  bool _actionInProgress = false;
-  String? _storageError;
-  String? _notificationWarning;
-  String? _actionError;
+  bool _isLoading = true; // True while we are reading from storage
 
   // ── "Due" tracking ──
   // For every medication, `_dueStatus` holds whether/when it was taken or
@@ -169,6 +166,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // so the warning banner doesn't flash on screen for a split second.
   bool _notificationsEnabled = true;
   bool _exactAlarmsEnabled = true;
+  bool _actionInProgress = false;
+  String? _storageError;
 
   // Re-checks which medications are due every 30 seconds, so a medication
   // becomes due (and its card appears) without the user needing to
@@ -207,23 +206,40 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _loadMedications() async {
-    final loaded = await MedicationStorage.load();
-    final dueStatus = await DueStatusStorage.loadAll();
-    setState(() {
-      _medications = loaded;
-      _dueStatus = dueStatus;
-      _isLoading = false;
-    });
-    _recomputeDue();
+    try {
+      final loaded = await MedicationStorage.load();
+      final dueStatus = await DueStatusStorage.loadAll();
+      if (!mounted) return;
+      setState(() {
+        _medications = loaded;
+        _dueStatus = dueStatus;
+        _storageError = null;
+        _isLoading = false;
+      });
+      _recomputeDue();
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _storageError =
+            'Saved medication data could not be read. Please retry before changing the schedule.';
+        _isLoading = false;
+      });
+    }
   }
 
   /// Ask Android whether notifications / exact alarms are currently allowed,
   /// and show/hide the warning banner accordingly.
   Future<void> _checkPermissions() async {
-    final notificationsEnabled = await NotificationService.instance
-        .areNotificationsEnabled();
-    final exactAlarmsEnabled = await NotificationService.instance
-        .canScheduleExactAlarms();
+    var notificationsEnabled = false;
+    var exactAlarmsEnabled = false;
+    try {
+      notificationsEnabled = await NotificationService.instance
+          .areNotificationsEnabled();
+      exactAlarmsEnabled = await NotificationService.instance
+          .canScheduleExactAlarms();
+    } catch (_) {
+      // Keep both false so the user sees that reminders need attention.
+    }
     if (!mounted) return;
     setState(() {
       _notificationsEnabled = notificationsEnabled;
@@ -253,153 +269,89 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   /// "I've taken it" — marks the dose as done for today, cancels any
   /// pending snooze reminder for it, and removes its due card.
   Future<void> _markTaken(Medication medication) async {
-    await DueStatusStorage.markTakenToday(medication.id);
-    await NotificationService.instance.cancel(
-      NotificationService.snoozeNotificationId(medication.id),
-    );
-    _dueStatus = await DueStatusStorage.loadAll();
-    _recomputeDue();
+    if (_actionInProgress) return;
+    setState(() => _actionInProgress = true);
+    try {
+      await DueStatusStorage.markTakenToday(medication.id);
+      try {
+        await NotificationService.instance.cancel(
+          NotificationService.snoozeNotificationId(medication.id),
+        );
+      } catch (_) {
+        _showMessage(
+          'Marked as taken, but an old snooze reminder may still appear.',
+        );
+      }
+      _dueStatus = await DueStatusStorage.loadAll();
+      _recomputeDue();
+    } catch (_) {
+      _showMessage('Could not save that the medication was taken. Try again.');
+    } finally {
+      if (mounted) setState(() => _actionInProgress = false);
+    }
   }
 
   /// "Remind me in 10 minutes" — hides the due card for now, and schedules
   /// a one-time reminder notification 10 minutes from now.
   Future<void> _snooze(Medication medication) async {
+    if (_actionInProgress) return;
+    setState(() => _actionInProgress = true);
     final snoozeUntil = DateTime.now().add(const Duration(minutes: 10));
-    await DueStatusStorage.snooze(medication.id, snoozeUntil);
-    await NotificationService.instance.scheduleOneOffReminder(
-      id: NotificationService.snoozeNotificationId(medication.id),
-      medicationName: medication.name,
-      dosage: medication.dosage,
-      fireAt: snoozeUntil,
-    );
-    _dueStatus = await DueStatusStorage.loadAll();
-    _recomputeDue();
-  }
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) _loadState();
-  }
-
-  Future<void> _loadState() async {
-    _refreshTimer?.cancel();
-    final now = widget.nowProvider();
     try {
-      final loadResult = await MedicationStorage.loadWithMetadata();
-      final medications = loadResult.medications;
-      if (loadResult.migrated) {
-        await NotificationService.instance.reconcileMedicationReminders(
-          medications,
-        );
-      }
-      final acknowledgements =
-          await MedicationStateStorage.loadAcknowledgements(now);
-      final reminderRetries = await ReminderRetryStorage.load();
-      var snoozes = await MedicationStateStorage.loadSnoozes(now);
-
-      final expired = snoozes
-          .where(
-            (value) =>
-                value.scheduledDate != localDateKey(now) ||
-                !value.snoozeUntil.isAfter(now),
-          )
-          .toList();
-      for (final snooze in expired) {
-        await MedicationStateStorage.clearSnooze(
-          snooze.medicationId,
-          snooze.scheduledDate,
-        );
-        if (snooze.scheduledDate != localDateKey(now)) {
-          final cancelled = await NotificationService.instance.cancelSnooze(
-            snooze.medicationId,
-          );
-          if (!cancelled) {
-            _notificationWarning =
-                'An old reminder may still appear. The app will retry cancelling it.';
-          }
-        }
-      }
-      if (expired.isNotEmpty) {
-        snoozes = await MedicationStateStorage.loadSnoozes(now);
-      }
-
-      if (!mounted) return;
-      setState(() {
-        _medications = medications;
-        _acknowledgements = acknowledgements;
-        _snoozes = snoozes;
-        _storageError = null;
-        _isLoading = false;
-        if (reminderRetries.any(
-          (id) => medications.any((medication) => medication.id == id),
-        )) {
-          _notificationWarning =
-              'One or more medication reminders need attention. Open caregiver setup to retry.';
-        }
-      });
-      _recompute(now);
-    } catch (_) {
-      if (!mounted) return;
-      setState(() {
-        _isLoading = false;
-        _storageError =
-            'Medication data is unavailable. The app will not treat this as an empty schedule.';
-      });
-    }
-  }
-
-  void _recompute(DateTime now) {
-    final occurrence = MedicationSchedule.nextOccurrence(
-      medications: _medications,
-      acknowledgements: _acknowledgements,
-      snoozes: _snoozes,
-      now: now,
-    );
-    if (mounted) setState(() => _occurrence = occurrence);
-    _armRefreshTimer(now, occurrence);
-  }
-
-  void _armRefreshTimer(DateTime now, MedicationOccurrence? occurrence) {
-    _refreshTimer?.cancel();
-    final midnight = DateTime(now.year, now.month, now.day + 1);
-    final boundaries = <DateTime>[midnight];
-    if (occurrence != null && occurrence.scheduledAt.isAfter(now)) {
-      boundaries.add(occurrence.scheduledAt);
-    }
-    final snoozeUntil = occurrence?.snoozedUntil;
-    if (snoozeUntil != null && snoozeUntil.isAfter(now)) {
-      boundaries.add(snoozeUntil);
-    }
-    boundaries.sort();
-    final delay = boundaries.first.difference(now) + const Duration(seconds: 1);
-    _refreshTimer = Timer(delay, _loadState);
-  }
-
-  Future<void> _openCaregiverSetup() async {
-    await Navigator.push<void>(
-      context,
-      MaterialPageRoute(builder: (_) => const CaregiverScheduleScreen()),
-    );
-    if (mounted) await _loadState();
-  }
-
-  Future<void> _retryNotificationPermissions() async {
-    try {
-      await NotificationService.instance.init();
-      final granted = await NotificationService.instance.requestPermissions();
-      if (!mounted) return;
-      setState(
-        () => _notificationWarning = granted
-            ? null
-            : 'Notification or exact-alarm access is still off. Reminders may not appear on time.',
+      await NotificationService.instance.scheduleOneOffReminder(
+        id: NotificationService.snoozeNotificationId(medication.id),
+        medicationName: medication.name,
+        dosage: medication.dosage,
+        fireAt: snoozeUntil,
       );
-    } catch (_) {
-      if (!mounted) return;
-      setState(
-        () => _notificationWarning =
-            'Reminder permissions could not be checked. Please try again.',
-      );
+      try {
+        await DueStatusStorage.snooze(medication.id, snoozeUntil);
+      } catch (_) {
+        await NotificationService.instance.cancel(
+          NotificationService.snoozeNotificationId(medication.id),
+        );
+        rethrow;
+      }
+      _dueStatus = await DueStatusStorage.loadAll();
       _recomputeDue();
+    } catch (_) {
+      _showMessage('The snooze reminder could not be scheduled. Try again.');
+    } finally {
+      if (mounted) setState(() => _actionInProgress = false);
+    }
+  }
+
+  /// Navigate to the Add Medication screen and wait for the result.
+  Future<void> _openAddForm() async {
+    // Navigator.push opens a new screen. When that screen calls Navigator.pop
+    // with a Medication object, it is returned here as `newMed`.
+    final newMed = await Navigator.push<Medication>(
+      context,
+      MaterialPageRoute(builder: (_) => const AddMedicationScreen()),
+    );
+    // If the user tapped Save (not Cancel), add the new medication.
+    if (newMed != null) {
+      final updated = [..._medications, newMed];
+      try {
+        await MedicationStorage.save(updated);
+        if (mounted) setState(() => _medications = updated);
+        try {
+          await NotificationService.instance.scheduleDailyMedicationReminder(
+            id: newMed.id,
+            medicationName: newMed.name,
+            dosage: newMed.dosage,
+            hour: newMed.hour,
+            minute: newMed.minute,
+          );
+        } catch (_) {
+          _showMessage(
+            '${newMed.name} was saved, but its reminder could not be scheduled.',
+          );
+        }
+        _recomputeDue();
+      } catch (_) {
+        _showMessage('The medication could not be saved. Please try again.');
+      }
     }
   }
 
@@ -407,14 +359,60 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   /// reminder notifications (both the daily one and any pending snooze).
   Future<void> _deleteMedication(int index) async {
     final removed = _medications[index];
+    final confirmed =
+        await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('Delete medication?'),
+            content: Text('Delete ${removed.name} and cancel its reminders?'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Keep medication'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                style: FilledButton.styleFrom(backgroundColor: Colors.red),
+                child: const Text('Delete'),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+    if (!confirmed) return;
+
     final updated = [..._medications]..removeAt(index);
-    setState(() => _medications = updated);
-    await MedicationStorage.save(updated);
-    await NotificationService.instance.cancel(removed.id);
-    await NotificationService.instance.cancel(
-      NotificationService.snoozeNotificationId(removed.id),
-    );
-    _recomputeDue();
+    try {
+      await MedicationStorage.save(updated);
+      if (mounted) setState(() => _medications = updated);
+      try {
+        await DueStatusStorage.remove(removed.id);
+      } catch (_) {
+        _showMessage(
+          '${removed.name} was deleted, but its old taken/snooze state could not be cleared.',
+        );
+      }
+      try {
+        await NotificationService.instance.cancel(removed.id);
+        await NotificationService.instance.cancel(
+          NotificationService.snoozeNotificationId(removed.id),
+        );
+      } catch (_) {
+        _showMessage(
+          '${removed.name} was deleted, but an old reminder may still appear.',
+        );
+      }
+      _recomputeDue();
+    } catch (_) {
+      _showMessage('The medication could not be deleted. Please try again.');
+    }
+  }
+
+  void _showMessage(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   @override
@@ -434,50 +432,82 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       // cards, then the full medication list below.
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
-          : Column(
-              children: [
-                if (!_notificationsEnabled || !_exactAlarmsEnabled)
-                  _buildPermissionBanner(),
-                if (_dueMedications.isNotEmpty) _buildDueSection(),
-                Expanded(
-                  child: _medications.isEmpty
-                      ? _buildEmptyState()
-                      : _buildMedicationList(),
-                ),
-              ],
-            ),
+          : _storageError != null
+          ? _buildStorageError()
+          : _buildSchedule(),
       // A large, labelled button so the action is obvious.
       floatingActionButton: FloatingActionButton.extended(
-        onPressed: _openAddForm,
+        onPressed: _storageError == null ? _openAddForm : null,
         backgroundColor: const Color(0xFF1A4B8C),
         foregroundColor: Colors.white,
-        title: const Text(
-          'My Medication',
-          style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold),
+        icon: const Icon(Icons.add, size: 30),
+        label: const Text(
+          'Add Medication',
+          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
         ),
-        actions: [
-          TextButton(
-            onPressed: _openCaregiverSetup,
-            style: TextButton.styleFrom(foregroundColor: Colors.white),
-            child: const Text('Caregiver setup'),
-          ),
-        ],
       ),
-      body: SafeArea(
+    );
+  }
+
+  Widget _buildStorageError() {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
         child: Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            if (_notificationWarning != null)
-              _MessageBanner(
-                message: _notificationWarning!,
-                icon: Icons.notifications_off_outlined,
-                actionLabel: 'Retry',
-                onAction: _retryNotificationPermissions,
-                onDismiss: () => setState(() => _notificationWarning = null),
-              ),
-            Expanded(child: _buildBody()),
+            const Icon(Icons.error_outline, size: 64, color: Colors.red),
+            const SizedBox(height: 16),
+            Text(
+              _storageError!,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 20),
+            ),
+            const SizedBox(height: 20),
+            FilledButton(
+              onPressed: _loadMedications,
+              child: const Text('Retry'),
+            ),
           ],
         ),
       ),
+    );
+  }
+
+  Widget _buildSchedule() {
+    final showPermissionWarning =
+        !_notificationsEnabled || !_exactAlarmsEnabled;
+    if (_medications.isEmpty) {
+      return Column(
+        children: [
+          if (showPermissionWarning) _buildPermissionBanner(),
+          Expanded(child: _buildEmptyState()),
+        ],
+      );
+    }
+
+    return ListView(
+      padding: const EdgeInsets.only(bottom: 100),
+      children: [
+        if (showPermissionWarning) _buildPermissionBanner(),
+        ..._dueMedications.map(
+          (medication) => _DueMedicationCard(
+            medication: medication,
+            onTaken: _actionInProgress ? null : () => _markTaken(medication),
+            onSnooze: _actionInProgress ? null : () => _snooze(medication),
+          ),
+        ),
+        const SizedBox(height: 20),
+        ..._medications.indexed.map(
+          (entry) => Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+            child: _MedicationCard(
+              medication: entry.$2,
+              onDelete: () => _deleteMedication(entry.$1),
+            ),
+          ),
+        ),
+      ],
     );
   }
 
@@ -552,21 +582,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
-  /// The stack of "due now" cards, one per medication that is currently due.
-  Widget _buildDueSection() {
-    return Column(
-      children: _dueMedications
-          .map(
-            (medication) => _DueMedicationCard(
-              medication: medication,
-              onTaken: () => _markTaken(medication),
-              onSnooze: () => _snooze(medication),
-            ),
-          )
-          .toList(),
-    );
-  }
-
   /// Friendly message shown when the list is empty.
   Widget _buildEmptyState() {
     return Center(
@@ -582,11 +597,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ),
             const SizedBox(height: 28),
             const Text(
-              'No medications set up',
+              'No medications yet',
               style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold),
               textAlign: TextAlign.center,
             ),
-            const SizedBox(height: 14),
+            const SizedBox(height: 16),
             const Text(
               'Tap "Add Medication" below\nto add your first one.',
               style: TextStyle(
@@ -596,11 +611,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               ),
               textAlign: TextAlign.center,
             ),
-            const SizedBox(height: 28),
-            ElevatedButton(
-              onPressed: onOpenCaregiver,
-              child: const Text('Open caregiver setup'),
-            ),
           ],
         ),
       ),
@@ -608,381 +618,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 }
 
-class _StorageUnavailableState extends StatelessWidget {
-  const _StorageUnavailableState({
-    required this.message,
-    required this.onRetry,
-    required this.onOpenCaregiver,
-  });
+// ─── Medication Card ───────────────────────────────────────────────────────
 
-  final String message;
-  final VoidCallback onRetry;
-  final VoidCallback onOpenCaregiver;
-
-  @override
-  Widget build(BuildContext context) {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(30),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            const Icon(Icons.error_outline, size: 72, color: Colors.red),
-            const SizedBox(height: 20),
-            Text(
-              message,
-              style: const TextStyle(fontSize: 20),
-              textAlign: TextAlign.center,
-            ),
-            const SizedBox(height: 26),
-            ElevatedButton(onPressed: onRetry, child: const Text('Try again')),
-            TextButton(
-              onPressed: onOpenCaregiver,
-              child: const Text('Open caregiver setup'),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _MessageBanner extends StatelessWidget {
-  const _MessageBanner({
-    required this.message,
-    required this.icon,
-    required this.onDismiss,
-    this.actionLabel,
-    this.onAction,
-  });
-
-  final String message;
-  final IconData icon;
-  final VoidCallback onDismiss;
-  final String? actionLabel;
-  final VoidCallback? onAction;
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      color: const Color(0xFFFFF4D6),
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 12, 8, 12),
-        child: Row(
-          children: [
-            Icon(icon, color: const Color(0xFF765000)),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Text(
-                message,
-                style: const TextStyle(fontSize: 16, height: 1.3),
-              ),
-            ),
-            if (actionLabel != null && onAction != null)
-              TextButton(onPressed: onAction, child: Text(actionLabel!)),
-            IconButton(
-              onPressed: onDismiss,
-              tooltip: 'Dismiss message',
-              icon: const Icon(Icons.close),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class CaregiverScheduleScreen extends StatefulWidget {
-  const CaregiverScheduleScreen({super.key});
-
-  @override
-  State<CaregiverScheduleScreen> createState() =>
-      _CaregiverScheduleScreenState();
-}
-
-class _CaregiverScheduleScreenState extends State<CaregiverScheduleScreen> {
-  List<Medication> _medications = [];
-  bool _isLoading = true;
-  String? _error;
-  String? _warning;
-  Medication? _medicationNeedingReminderRetry;
-
-  @override
-  void initState() {
-    super.initState();
-    _load();
-  }
-
-  Future<void> _load() async {
-    try {
-      final loadResult = await MedicationStorage.loadWithMetadata();
-      final medications = loadResult.medications;
-      if (loadResult.migrated) {
-        await NotificationService.instance.reconcileMedicationReminders(
-          medications,
-        );
-      }
-      final reminderRetries = await ReminderRetryStorage.load();
-      Medication? retryMedication;
-      for (final medication in medications) {
-        if (reminderRetries.contains(medication.id)) {
-          retryMedication = medication;
-          break;
-        }
-      }
-      if (!mounted) return;
-      setState(() {
-        _medications = medications;
-        _isLoading = false;
-        _error = null;
-        if (retryMedication != null) {
-          _warning =
-              'The reminder for ${retryMedication.name} needs to be scheduled.';
-          _medicationNeedingReminderRetry = retryMedication;
-        }
-      });
-    } catch (_) {
-      if (!mounted) return;
-      setState(() {
-        _isLoading = false;
-        _error =
-            'Medication data is unavailable. Retry before changing the schedule.';
-      });
-    }
-  }
-
-  Future<void> _openAddForm() async {
-    final newMedication = await Navigator.push<Medication>(
-      context,
-      MaterialPageRoute(builder: (_) => const AddMedicationScreen()),
-    );
-    if (newMedication == null || !mounted) return;
-
-    final updated = [..._medications, newMedication];
-    try {
-      await MedicationStorage.save(updated);
-      if (mounted) setState(() => _medications = updated);
-      try {
-        await NotificationService.instance.scheduleDailyMedicationReminder(
-          id: newMedication.id,
-          medicationName: newMedication.name,
-          dosage: newMedication.dosage,
-          hour: newMedication.hour,
-          minute: newMedication.minute,
-        );
-        await ReminderRetryStorage.remove(newMedication.id);
-      } catch (_) {
-        try {
-          await ReminderRetryStorage.add(newMedication.id);
-        } catch (_) {
-          // The current screen warning remains the fallback for this session.
-        }
-        if (mounted) {
-          setState(() {
-            _warning =
-                'Medication saved, but its reminder could not be scheduled.';
-            _medicationNeedingReminderRetry = newMedication;
-          });
-        }
-      }
-    } catch (_) {
-      if (!mounted) return;
-      setState(
-        () => _warning =
-            'The medication could not be saved. No reminder was added.',
-      );
-    }
-  }
-
-  Future<void> _retryReminder() async {
-    final medication = _medicationNeedingReminderRetry;
-    if (medication == null) return;
-    try {
-      await NotificationService.instance.scheduleDailyMedicationReminder(
-        id: medication.id,
-        medicationName: medication.name,
-        dosage: medication.dosage,
-        hour: medication.hour,
-        minute: medication.minute,
-      );
-      await ReminderRetryStorage.remove(medication.id);
-      if (!mounted) return;
-      setState(() {
-        _warning = null;
-        _medicationNeedingReminderRetry = null;
-      });
-    } catch (_) {
-      if (!mounted) return;
-      setState(
-        () => _warning =
-            'The reminder still could not be scheduled. Check Android permissions and try again.',
-      );
-    }
-  }
-
-  Future<void> _deleteMedication(int index) async {
-    final medication = _medications[index];
-    final confirmed =
-        await showDialog<bool>(
-          context: context,
-          builder: (context) => AlertDialog(
-            title: const Text('Delete medication?'),
-            content: Text(
-              'Delete ${medication.name} and cancel its reminders?',
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(context, false),
-                child: const Text('Keep medication'),
-              ),
-              FilledButton(
-                onPressed: () => Navigator.pop(context, true),
-                style: FilledButton.styleFrom(backgroundColor: Colors.red),
-                child: const Text('Delete'),
-              ),
-            ],
-          ),
-        ) ??
-        false;
-    if (!confirmed || !mounted) return;
-
-    final updated = [..._medications]..removeAt(index);
-    try {
-      await MedicationStorage.save(updated);
-      if (mounted) setState(() => _medications = updated);
-      try {
-        await ReminderRetryStorage.remove(medication.id);
-      } catch (_) {
-        // Deletion remains authoritative even if retry metadata cleanup fails.
-      }
-      try {
-        await MedicationStateStorage.clearAllSnoozesForMedication(
-          medication.id,
-        );
-      } catch (_) {
-        if (mounted) {
-          setState(
-            () => _warning =
-                'The medication was deleted, but old snooze data could not be cleared.',
-          );
-        }
-      }
-      final cancelled = await NotificationService.instance
-          .cancelAllForMedication(medication.id);
-      if (!cancelled && mounted) {
-        setState(
-          () => _warning =
-              'The medication was deleted, but an old reminder may still appear. Cancellation will be retried.',
-        );
-      }
-    } catch (_) {
-      if (!mounted) return;
-      setState(
-        () =>
-            _warning = 'The medication could not be deleted. Please try again.',
-      );
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.white,
-      appBar: AppBar(
-        backgroundColor: const Color(0xFF1A4B8C),
-        foregroundColor: Colors.white,
-        title: const Text(
-          'Medication Schedule',
-          style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
-        ),
-      ),
-      body: Column(
-        children: [
-          if (_warning != null)
-            _MessageBanner(
-              message: _warning!,
-              icon: Icons.warning_amber,
-              actionLabel: _medicationNeedingReminderRetry == null
-                  ? null
-                  : 'Retry',
-              onAction: _medicationNeedingReminderRetry == null
-                  ? null
-                  : _retryReminder,
-              onDismiss: () => setState(() {
-                _warning = null;
-                _medicationNeedingReminderRetry = null;
-              }),
-            ),
-          Expanded(child: _buildBody()),
-        ],
-      ),
-      floatingActionButton: _error == null && !_isLoading
-          ? FloatingActionButton.extended(
-              onPressed: _openAddForm,
-              backgroundColor: const Color(0xFF1A4B8C),
-              foregroundColor: Colors.white,
-              icon: const Icon(Icons.add, size: 30),
-              label: const Text(
-                'Add Medication',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-              ),
-            )
-          : null,
-    );
-  }
-
-  Widget _buildBody() {
-    if (_isLoading) {
-      return const Center(child: CircularProgressIndicator());
-    }
-    if (_error != null) {
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(30),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Text(
-                _error!,
-                style: const TextStyle(fontSize: 20),
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 20),
-              ElevatedButton(onPressed: _load, child: const Text('Try again')),
-            ],
-          ),
-        ),
-      );
-    }
-    return ListView.separated(
-      padding: const EdgeInsets.fromLTRB(
-        16,
-        20,
-        16,
-        100,
-      ), // bottom padding clears the FAB
-      itemCount: _medications.length,
-      separatorBuilder: (_, _) => const SizedBox(height: 14),
-      itemBuilder: (context, index) {
-        if (index == 0) {
-          return const Padding(
-            padding: EdgeInsets.fromLTRB(4, 0, 4, 8),
-            child: Text(
-              'Set reminders using the medication label or instructions from a healthcare professional.',
-              style: TextStyle(fontSize: 18, height: 1.4),
-            ),
-          );
-        }
-        final medicationIndex = index - 1;
-        return _MedicationCard(
-          medication: _medications[medicationIndex],
-          onDelete: () => _deleteMedication(medicationIndex),
-        );
-      },
-    );
-  }
-}
-
+/// A single card in the medication list showing name, dosage, and time.
 class _MedicationCard extends StatelessWidget {
   const _MedicationCard({required this.medication, required this.onDelete});
 
@@ -992,12 +630,13 @@ class _MedicationCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Card(
-      elevation: 2,
+      elevation: 3,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 18),
         child: Row(
           children: [
+            // Blue icon badge on the left
             Container(
               padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
@@ -1011,6 +650,7 @@ class _MedicationCard extends StatelessWidget {
               ),
             ),
             const SizedBox(width: 16),
+            // Medication details in the middle
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -1022,8 +662,6 @@ class _MedicationCard extends StatelessWidget {
                       fontWeight: FontWeight.bold,
                     ),
                   ),
-                  const SizedBox(height: 6),
-                  Text(medication.dosage, style: const TextStyle(fontSize: 18)),
                   const SizedBox(height: 6),
                   Text(
                     medication.dosage,
@@ -1050,6 +688,7 @@ class _MedicationCard extends StatelessWidget {
                 ],
               ),
             ),
+            // Delete button on the right — large tap target
             IconButton(
               onPressed: onDelete,
               icon: const Icon(
@@ -1081,8 +720,8 @@ class _DueMedicationCard extends StatelessWidget {
   });
 
   final Medication medication;
-  final VoidCallback onTaken;
-  final VoidCallback onSnooze;
+  final VoidCallback? onTaken;
+  final VoidCallback? onSnooze;
 
   @override
   Widget build(BuildContext context) {
@@ -1211,37 +850,36 @@ class AddMedicationScreen extends StatefulWidget {
 }
 
 class _AddMedicationScreenState extends State<AddMedicationScreen> {
+  // The form key lets us validate all fields at once when the user taps Save.
   final _formKey = GlobalKey<FormState>();
+
   final _nameController = TextEditingController();
   final _dosageController = TextEditingController();
+
+  // Null until the user picks a time from the time picker.
   TimeOfDay? _selectedTime;
-  bool _isPreparing = false;
 
   @override
   void dispose() {
+    // Free up memory when this screen is closed.
     _nameController.dispose();
     _dosageController.dispose();
     super.dispose();
   }
 
+  /// Open the built-in system time picker dialog.
   Future<void> _pickTime() async {
     final picked = await showTimePicker(
       context: context,
       initialTime: _selectedTime ?? TimeOfDay.now(),
       helpText: 'Select time to take medication',
-      builder: (context, child) {
-        // Make the time picker's own text a bit larger too.
-        return MediaQuery(
-          data: MediaQuery.of(
-            context,
-          ).copyWith(textScaler: const TextScaler.linear(1.2)),
-          child: child!,
-        );
-      },
     );
-    if (picked != null && mounted) setState(() => _selectedTime = picked);
+    if (picked != null) {
+      setState(() => _selectedTime = picked);
+    }
   }
 
+  /// Convert a TimeOfDay to a human-friendly string like "8:30 AM".
   String _formatTime(TimeOfDay time) {
     final hour = time.hourOfPeriod == 0 ? 12 : time.hourOfPeriod;
     final minute = time.minute.toString().padLeft(2, '0');
@@ -1249,8 +887,12 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
     return '$hour:$minute $period';
   }
 
-  Future<void> _save() async {
+  /// Validate the form; if everything looks good, pop back to HomeScreen
+  /// and pass the new Medication as the result.
+  void _save() {
+    // _formKey.currentState!.validate() checks each field's validator function.
     if (!_formKey.currentState!.validate()) return;
+
     if (_selectedTime == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
@@ -1264,31 +906,21 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
       return;
     }
 
-    setState(() => _isPreparing = true);
-    try {
-      final id = await MedicationStorage.createId();
-      if (!mounted) return;
-      Navigator.pop(
-        context,
-        Medication(
-          id: id,
-          name: _nameController.text.trim(),
-          dosage: _dosageController.text.trim(),
-          time: _formatTime(_selectedTime!),
-          hour: _selectedTime!.hour,
-          minute: _selectedTime!.minute,
-        ),
-      );
-    } catch (_) {
-      if (!mounted) return;
-      setState(() => _isPreparing = false);
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('The medication could not be prepared. Try again.'),
-          backgroundColor: Colors.red,
-        ),
-      );
-    }
+    // Send the new medication back to HomeScreen.
+    Navigator.pop(
+      context,
+      Medication(
+        // Android notification ids must fit in a 32-bit int, so we can't
+        // use the full millisecondsSinceEpoch value directly — this keeps
+        // it small while still being unique enough for a simple app.
+        id: DateTime.now().millisecondsSinceEpoch.remainder(1000000000),
+        name: _nameController.text.trim(),
+        dosage: _dosageController.text.trim(),
+        time: _formatTime(_selectedTime!),
+        hour: _selectedTime!.hour,
+        minute: _selectedTime!.minute,
+      ),
+    );
   }
 
   @override
@@ -1303,6 +935,7 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
           style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
         ),
       ),
+      // SingleChildScrollView lets the page scroll if the keyboard pushes it up.
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(24),
         child: Form(
@@ -1324,11 +957,16 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
                   hintText: 'e.g. Lisinopril',
                   prefixIcon: Icon(Icons.medication, size: 28),
                 ),
-                validator: (value) => value == null || value.trim().isEmpty
-                    ? 'Please enter the medication name.'
-                    : null,
+                validator: (value) {
+                  if (value == null || value.trim().isEmpty) {
+                    return 'Please enter the medication name.';
+                  }
+                  return null; // null means "no error"
+                },
               ),
               const SizedBox(height: 28),
+
+              // ── Dosage ───────────────────────────────────────────────────
               const Text(
                 'Dosage',
                 style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
@@ -1338,16 +976,21 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
                 controller: _dosageController,
                 style: const TextStyle(fontSize: 20),
                 decoration: const InputDecoration(
-                  hintText: 'e.g. 10 mg',
+                  hintText: 'e.g. 500 mg',
                   prefixIcon: Icon(Icons.scale, size: 28),
                 ),
-                validator: (value) => value == null || value.trim().isEmpty
-                    ? 'Please enter the dosage.'
-                    : null,
+                validator: (value) {
+                  if (value == null || value.trim().isEmpty) {
+                    return 'Please enter the dosage.';
+                  }
+                  return null;
+                },
               ),
               const SizedBox(height: 28),
+
+              // ── Time ─────────────────────────────────────────────────────
               const Text(
-                'Reminder Time',
+                'Time to Take',
                 style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
               ),
               const SizedBox(height: 10),
@@ -1382,26 +1025,16 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
                               ? Colors.black45
                               : Colors.black87,
                         ),
-                        const SizedBox(width: 12),
-                        Text(
-                          _selectedTime == null
-                              ? 'Tap to select a time'
-                              : _formatTime(_selectedTime!),
-                          style: TextStyle(
-                            fontSize: 20,
-                            color: _selectedTime == null
-                                ? Colors.black54
-                                : Colors.black87,
-                          ),
-                        ),
-                      ],
-                    ),
+                      ),
+                    ],
                   ),
                 ),
               ),
               const SizedBox(height: 44),
+
+              // ── Save Button ───────────────────────────────────────────────
               ElevatedButton.icon(
-                onPressed: _isPreparing ? null : _save,
+                onPressed: _save,
                 style: ElevatedButton.styleFrom(
                   backgroundColor: const Color(0xFF1A4B8C),
                   foregroundColor: Colors.white,
@@ -1410,13 +1043,7 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
                     borderRadius: BorderRadius.circular(12),
                   ),
                 ),
-                icon: _isPreparing
-                    ? const SizedBox(
-                        width: 24,
-                        height: 24,
-                        child: CircularProgressIndicator(strokeWidth: 3),
-                      )
-                    : const Icon(Icons.save, size: 28),
+                icon: const Icon(Icons.save, size: 28),
                 label: const Text(
                   'Save Medication',
                   style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
@@ -1428,10 +1055,4 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
       ),
     );
   }
-}
-
-String _formatClock(DateTime value) {
-  final hour = value.hour % 12 == 0 ? 12 : value.hour % 12;
-  final minute = value.minute.toString().padLeft(2, '0');
-  return '$hour:$minute ${value.hour < 12 ? 'AM' : 'PM'}';
 }

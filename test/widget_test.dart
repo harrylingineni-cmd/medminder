@@ -1,177 +1,107 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:med_app/main.dart';
-import 'package:med_app/medication_state.dart';
 
 void main() {
   setUp(() {
     SharedPreferences.setMockInitialValues({});
   });
 
-  testWidgets('empty patient screen directs caregiver to setup', (
+  testWidgets('empty schedule explains how to add a medication', (
     tester,
   ) async {
     await tester.pumpWidget(const MedTrackerApp());
     await tester.pumpAndSettle();
 
-    expect(find.text('No medications set up'), findsOneWidget);
-    expect(find.text('Open caregiver setup'), findsOneWidget);
-    expect(find.byIcon(Icons.delete_outline), findsNothing);
-  });
-
-  testWidgets(
-    'tomorrow medication is visible without acknowledgement actions',
-    (tester) async {
-      final now = DateTime.now();
-      await MedicationStorage.save([
-        Medication(
-          id: 101,
-          name: 'Example Medicine',
-          dosage: '10 mg',
-          time: _formatTime(now),
-          hour: now.hour,
-          minute: now.minute,
-        ),
-      ]);
-      await MedicationStateStorage.acknowledge(
-        MedicationAcknowledgement(
-          medicationId: 101,
-          scheduledDate: localDateKey(now),
-          acknowledgedAt: now,
-        ),
-      );
-
-      await tester.pumpWidget(const MedTrackerApp());
-      await tester.pumpAndSettle();
-
-      expect(find.text('Example Medicine'), findsOneWidget);
-      expect(find.text('I’ve taken it'), findsNothing);
-      expect(find.text('Remind me in 10 minutes'), findsNothing);
-      expect(find.byIcon(Icons.delete_outline), findsNothing);
-    },
-  );
-
-  testWidgets('due medication can be acknowledged and advances', (
-    tester,
-  ) async {
-    final now = DateTime.now();
-    await MedicationStorage.save([
-      Medication(
-        id: 202,
-        name: 'Example Medicine',
-        dosage: '10 mg',
-        time: _formatTime(now),
-        hour: now.hour,
-        minute: now.minute,
-      ),
-    ]);
-
-    await tester.pumpWidget(MedTrackerApp(nowProvider: () => now));
-    await tester.pumpAndSettle();
-    expect(find.text('I’ve taken it'), findsOneWidget);
-
-    await tester.tap(find.text('I’ve taken it'));
-    await tester.pumpAndSettle();
-
-    expect(find.text('Marked as taken'), findsOneWidget);
-    expect(find.textContaining('Example Medicine'), findsWidgets);
-    expect(find.text('Continue'), findsOneWidget);
-  });
-
-  testWidgets('rapid taken and snooze taps produce one acknowledgement', (
-    tester,
-  ) async {
-    final now = DateTime(2026, 7, 11, 8, 30);
-    await MedicationStorage.save(const [
-      Medication(
-        id: 212,
-        name: 'Race Example',
-        dosage: '10 mg',
-        time: '8:30 AM',
-        hour: 8,
-        minute: 30,
-      ),
-    ]);
-
-    await tester.pumpWidget(MedTrackerApp(nowProvider: () => now));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('I’ve taken it'));
-    await tester.tap(find.text('Remind me in 10 minutes'));
-    await tester.pumpAndSettle();
-
-    expect(find.text('Marked as taken'), findsOneWidget);
-    expect(await MedicationStateStorage.loadSnoozes(now), isEmpty);
-    expect(
-      await MedicationStateStorage.loadAcknowledgements(now),
-      hasLength(1),
-    );
-  });
-
-  testWidgets('caregiver screen contains management controls', (tester) async {
-    await MedicationStorage.save(const [
-      Medication(
-        id: 303,
-        name: 'Example Medicine',
-        dosage: '5 mg',
-        time: '8:30 AM',
-        hour: 8,
-        minute: 30,
-      ),
-    ]);
-
-    await tester.pumpWidget(const MedTrackerApp());
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Caregiver setup'));
-    await tester.pumpAndSettle();
-
-    expect(find.text('Medication Schedule'), findsOneWidget);
+    expect(find.text('No medications yet'), findsOneWidget);
     expect(find.text('Add Medication'), findsOneWidget);
-    expect(find.byIcon(Icons.delete_outline), findsOneWidget);
-
-    await tester.tap(find.byIcon(Icons.delete_outline));
-    await tester.pumpAndSettle();
-    expect(find.text('Delete medication?'), findsOneWidget);
-    expect(find.text('Keep medication'), findsOneWidget);
-
-    await tester.tap(find.text('Keep medication'));
-    await tester.pumpAndSettle();
-    expect(find.text('Example Medicine'), findsOneWidget);
-    expect((await MedicationStorage.load()).length, 1);
   });
 
-  testWidgets('corrupt medication data is not presented as an empty schedule', (
-    tester,
-  ) async {
+  testWidgets('due medication shows taken and snooze actions', (tester) async {
+    final now = DateTime.now();
     SharedPreferences.setMockInitialValues({
-      'medications': ['not valid json'],
+      'medications': [
+        jsonEncode(
+          Medication(
+            id: 10,
+            name: 'Example Medicine',
+            dosage: '5 mg',
+            time: _formatTime(now),
+            hour: now.hour,
+            minute: now.minute,
+          ).toJson(),
+        ),
+      ],
     });
 
     await tester.pumpWidget(const MedTrackerApp());
     await tester.pumpAndSettle();
 
-    expect(
-      find.textContaining('Medication data is unavailable'),
-      findsOneWidget,
-    );
-    expect(find.text('No medications set up'), findsNothing);
-    expect(find.text('Try again'), findsOneWidget);
+    expect(find.text('Medication Due'), findsOneWidget);
+    expect(find.text("I've taken it"), findsOneWidget);
+    expect(find.text('Remind Me in 10 Minutes'), findsOneWidget);
+  });
 
-    await tester.tap(find.text('Open caregiver setup'));
+  testWidgets('marking a due medication taken hides the due card', (
+    tester,
+  ) async {
+    final now = DateTime.now();
+    await MedicationStorage.save([
+      Medication(
+        id: 11,
+        name: 'Taken Example',
+        dosage: '5 mg',
+        time: _formatTime(now),
+        hour: now.hour,
+        minute: now.minute,
+      ),
+    ]);
+    await tester.pumpWidget(const MedTrackerApp());
     await tester.pumpAndSettle();
+
+    await tester.tap(find.text("I've taken it"));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Medication Due'), findsNothing);
+    expect(find.text('Taken Example'), findsOneWidget);
+  });
+
+  testWidgets('failed snooze remains due and explains the problem', (
+    tester,
+  ) async {
+    final now = DateTime.now();
+    await MedicationStorage.save([
+      Medication(
+        id: 12,
+        name: 'Snooze Example',
+        dosage: '5 mg',
+        time: _formatTime(now),
+        hour: now.hour,
+        minute: now.minute,
+      ),
+    ]);
+    await tester.pumpWidget(const MedTrackerApp());
+    await tester.pumpAndSettle();
+
+    final snoozeButton = find.text('Remind Me in 10 Minutes');
+    await tester.drag(find.byType(ListView), const Offset(0, -200));
+    await tester.pumpAndSettle();
+    await tester.tap(snoozeButton);
+    await tester.pumpAndSettle();
+
+    expect(find.text('Medication Due'), findsOneWidget);
     expect(
-      find.textContaining('Retry before changing the schedule'),
+      find.text('The snooze reminder could not be scheduled. Try again.'),
       findsOneWidget,
     );
   });
 
-  testWidgets('add form validates fields and requires a reminder time', (
-    tester,
-  ) async {
+  testWidgets('add form validates all required information', (tester) async {
     await tester.pumpWidget(const MedTrackerApp());
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Caregiver setup'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Add Medication'));
     await tester.pumpAndSettle();
@@ -185,67 +115,79 @@ void main() {
     await tester.enterText(find.byType(TextFormField).at(1), '5 mg');
     await tester.tap(find.text('Save Medication'));
     await tester.pumpAndSettle();
-    expect(find.text('Please select a reminder time.'), findsOneWidget);
+    expect(find.text('Please select a time.'), findsOneWidget);
   });
 
-  testWidgets(
-    'valid add persists medication when platform reminder is absent',
-    (tester) async {
-      await tester.pumpWidget(const MedTrackerApp());
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Caregiver setup'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Add Medication'));
-      await tester.pumpAndSettle();
+  testWidgets('valid medication is saved even if its reminder fails', (
+    tester,
+  ) async {
+    await tester.pumpWidget(const MedTrackerApp());
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Add Medication'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextFormField).at(0), 'Saved Example');
+    await tester.enterText(find.byType(TextFormField).at(1), '10 mg');
+    await tester.tap(find.text('Tap to select a time'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('OK'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Save Medication'));
+    await tester.pumpAndSettle();
 
-      await tester.enterText(
-        find.byType(TextFormField).at(0),
-        'Example Medicine',
-      );
-      await tester.enterText(find.byType(TextFormField).at(1), '5 mg');
-      await tester.tap(find.text('Tap to select a time'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('OK'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Save Medication'));
-      await tester.pumpAndSettle();
+    expect(find.text('Saved Example'), findsOneWidget);
+    expect(await MedicationStorage.load(), hasLength(1));
+    expect(
+      find.textContaining('reminder could not be scheduled'),
+      findsOneWidget,
+    );
+  });
 
-      expect(find.text('Medication Schedule'), findsOneWidget);
-      expect(find.text('Example Medicine'), findsOneWidget);
-      expect((await MedicationStorage.load()), hasLength(1));
-      expect(
-        find.textContaining('reminder could not be scheduled'),
-        findsOneWidget,
-      );
-    },
-  );
+  testWidgets('delete requires confirmation and persists removal', (
+    tester,
+  ) async {
+    await MedicationStorage.save(const [
+      Medication(
+        id: 20,
+        name: 'Keep Me',
+        dosage: '1 tablet',
+        time: '11:59 PM',
+        hour: 23,
+        minute: 59,
+      ),
+    ]);
+    await tester.pumpWidget(const MedTrackerApp());
+    await tester.pumpAndSettle();
 
-  testWidgets(
-    'confirmed delete persists removal even if platform cancel fails',
-    (tester) async {
-      await MedicationStorage.save(const [
-        Medication(
-          id: 404,
-          name: 'Delete Me',
-          dosage: '1 mg',
-          time: '8:30 AM',
-          hour: 8,
-          minute: 30,
-        ),
-      ]);
-      await tester.pumpWidget(const MedTrackerApp());
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Caregiver setup'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.byIcon(Icons.delete_outline));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Delete'));
-      await tester.pumpAndSettle();
+    await tester.tap(find.byIcon(Icons.delete_outline));
+    await tester.pumpAndSettle();
+    expect(find.text('Delete medication?'), findsOneWidget);
+    await tester.tap(find.text('Keep medication'));
+    await tester.pumpAndSettle();
+    expect(find.text('Keep Me'), findsOneWidget);
 
-      expect(find.text('Delete Me'), findsNothing);
-      expect(await MedicationStorage.load(), isEmpty);
-    },
-  );
+    await tester.tap(find.byIcon(Icons.delete_outline));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Delete'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Keep Me'), findsNothing);
+    expect(await MedicationStorage.load(), isEmpty);
+  });
+
+  testWidgets('corrupt medication data shows a recoverable error', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({
+      'medications': ['not valid json'],
+    });
+
+    await tester.pumpWidget(const MedTrackerApp());
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('could not be read'), findsOneWidget);
+    expect(find.text('Retry'), findsOneWidget);
+    expect(find.text('No medications yet'), findsNothing);
+  });
 }
 
 String _formatTime(DateTime value) {

@@ -3,8 +3,6 @@ import 'package:flutter_timezone/flutter_timezone.dart';
 import 'package:timezone/data/latest_all.dart' as tz_data;
 import 'package:timezone/timezone.dart' as tz;
 
-import 'medication_state.dart';
-
 /// Everything related to showing and scheduling local medication reminder
 /// notifications lives in this one class.
 ///
@@ -47,7 +45,6 @@ class NotificationService {
     const initSettings = InitializationSettings(android: androidSettings);
     await _plugin.initialize(settings: initSettings);
     _initialized = true;
-    await retryPendingCancellations();
   }
 
   /// Asks the user for the two permissions Android requires for scheduled
