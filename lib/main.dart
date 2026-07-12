@@ -1,4 +1,10 @@
-import 'dart:async';
+import 'dart:async'; // For Timer, used to re-check "is it due yet?"
+import 'dart:convert'; // For turning our data into text so it can be saved
+import 'package:app_settings/app_settings.dart'; // Opens the phone's Settings screens
+import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart'; // For local storage
+import 'due_status_storage.dart'; // Tracks "taken today" / "snoozed" per medication
+import 'notification_service.dart'; // Schedules the medication reminders
 
 import 'package:flutter/material.dart';
 
@@ -32,8 +38,67 @@ class MedTrackerApp extends StatelessWidget {
     this.nowProvider = DateTime.now,
   });
 
-  final String? initialNotificationWarning;
-  final DateTime Function() nowProvider;
+  /// Turn this medication into a Map so it can be saved as JSON text.
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'name': name,
+    'dosage': dosage,
+    'time': time,
+    'hour': hour,
+    'minute': minute,
+  };
+
+  /// Recreate a Medication from a Map that was loaded out of storage.
+  factory Medication.fromJson(Map<String, dynamic> json) => Medication(
+    // Older saved medications (from before reminders were added) won't
+    // have an id/hour/minute yet, so fall back to sensible defaults
+    // rather than crashing.
+    id:
+        json['id'] as int? ??
+        DateTime.now().millisecondsSinceEpoch.remainder(1000000000),
+    name: json['name'] as String,
+    dosage: json['dosage'] as String,
+    time: json['time'] as String,
+    hour: json['hour'] as int? ?? 8,
+    minute: json['minute'] as int? ?? 0,
+  );
+}
+
+// ─── Storage Helper ────────────────────────────────────────────────────────
+
+/// All the code for reading and writing medications to the device lives here.
+///
+/// SharedPreferences stores simple key→value pairs on the device.
+/// Because it can only store strings, we convert each Medication to a JSON
+/// string before saving, and parse it back when loading.
+class MedicationStorage {
+  // The key used to look up our list inside SharedPreferences.
+  static const _storageKey = 'medications';
+
+  /// Load all saved medications from the device.
+  /// Returns an empty list if nothing has been saved yet.
+  static Future<List<Medication>> load() async {
+    final prefs = await SharedPreferences.getInstance();
+    // getStringList returns null if the key doesn't exist yet, so we use ?? []
+    final jsonStrings = prefs.getStringList(_storageKey) ?? [];
+    return jsonStrings
+        .map((s) => Medication.fromJson(jsonDecode(s) as Map<String, dynamic>))
+        .toList();
+  }
+
+  /// Save the full list of medications to the device, replacing the old list.
+  static Future<void> save(List<Medication> medications) async {
+    final prefs = await SharedPreferences.getInstance();
+    final jsonStrings = medications.map((m) => jsonEncode(m.toJson())).toList();
+    await prefs.setStringList(_storageKey, jsonStrings);
+  }
+}
+
+// ─── App Root ──────────────────────────────────────────────────────────────
+
+/// The root of the app. Sets up the overall look and feel.
+class MedTrackerApp extends StatelessWidget {
+  const MedTrackerApp({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -76,6 +141,8 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
+// `WidgetsBindingObserver` lets us find out when the user comes back to the
+// app (e.g. after visiting Settings), via `didChangeAppLifecycleState`.
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   List<Medication> _medications = [];
   List<MedicationAcknowledgement> _acknowledgements = [];
@@ -90,19 +157,123 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   String? _notificationWarning;
   String? _actionError;
 
+  // ── "Due" tracking ──
+  // For every medication, `_dueStatus` holds whether/when it was taken or
+  // snoozed today. `_dueMedications` is the subset of `_medications` that
+  // are currently due, recomputed whenever anything relevant changes.
+  Map<int, DueStatusEntry> _dueStatus = {};
+  List<Medication> _dueMedications = [];
+
+  // ── Permission banner ──
+  // Both default to `true` (assume granted) until we've actually checked,
+  // so the warning banner doesn't flash on screen for a split second.
+  bool _notificationsEnabled = true;
+  bool _exactAlarmsEnabled = true;
+
+  // Re-checks which medications are due every 30 seconds, so a medication
+  // becomes due (and its card appears) without the user needing to
+  // manually refresh or reopen the app right at the scheduled time.
+  Timer? _dueCheckTimer;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _notificationWarning = widget.notificationWarning;
-    _loadState();
+    // Load saved medications as soon as the screen appears.
+    _loadMedications();
+    _checkPermissions();
+    _dueCheckTimer = Timer.periodic(
+      const Duration(seconds: 30),
+      (_) => _recomputeDue(),
+    );
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _refreshTimer?.cancel();
+    _dueCheckTimer?.cancel();
     super.dispose();
+  }
+
+  /// Called when the app is backgrounded, resumed, etc. We care about
+  /// "resumed" — the user switching back to the app, for example after
+  /// tapping our permission banner and changing a setting.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _checkPermissions();
+      _recomputeDue();
+    }
+  }
+
+  Future<void> _loadMedications() async {
+    final loaded = await MedicationStorage.load();
+    final dueStatus = await DueStatusStorage.loadAll();
+    setState(() {
+      _medications = loaded;
+      _dueStatus = dueStatus;
+      _isLoading = false;
+    });
+    _recomputeDue();
+  }
+
+  /// Ask Android whether notifications / exact alarms are currently allowed,
+  /// and show/hide the warning banner accordingly.
+  Future<void> _checkPermissions() async {
+    final notificationsEnabled = await NotificationService.instance
+        .areNotificationsEnabled();
+    final exactAlarmsEnabled = await NotificationService.instance
+        .canScheduleExactAlarms();
+    if (!mounted) return;
+    setState(() {
+      _notificationsEnabled = notificationsEnabled;
+      _exactAlarmsEnabled = exactAlarmsEnabled;
+    });
+  }
+
+  /// Re-checks, for every medication, whether it counts as "due" right now
+  /// (see `isMedicationDue` in due_status_storage.dart for the exact rule),
+  /// and updates `_dueMedications` so the due cards on screen stay current.
+  void _recomputeDue() {
+    if (!mounted) return;
+    final now = DateTime.now();
+    final due = _medications
+        .where(
+          (m) => isMedicationDue(
+            hour: m.hour,
+            minute: m.minute,
+            status: _dueStatus[m.id],
+            now: now,
+          ),
+        )
+        .toList();
+    setState(() => _dueMedications = due);
+  }
+
+  /// "I've taken it" — marks the dose as done for today, cancels any
+  /// pending snooze reminder for it, and removes its due card.
+  Future<void> _markTaken(Medication medication) async {
+    await DueStatusStorage.markTakenToday(medication.id);
+    await NotificationService.instance.cancel(
+      NotificationService.snoozeNotificationId(medication.id),
+    );
+    _dueStatus = await DueStatusStorage.loadAll();
+    _recomputeDue();
+  }
+
+  /// "Remind me in 10 minutes" — hides the due card for now, and schedules
+  /// a one-time reminder notification 10 minutes from now.
+  Future<void> _snooze(Medication medication) async {
+    final snoozeUntil = DateTime.now().add(const Duration(minutes: 10));
+    await DueStatusStorage.snooze(medication.id, snoozeUntil);
+    await NotificationService.instance.scheduleOneOffReminder(
+      id: NotificationService.snoozeNotificationId(medication.id),
+      medicationName: medication.name,
+      dosage: medication.dosage,
+      fireAt: snoozeUntil,
+    );
+    _dueStatus = await DueStatusStorage.loadAll();
+    _recomputeDue();
   }
 
   @override
@@ -228,129 +399,22 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         () => _notificationWarning =
             'Reminder permissions could not be checked. Please try again.',
       );
+      _recomputeDue();
     }
   }
 
-  Future<void> _acknowledge() async {
-    final occurrence = _occurrence;
-    final now = widget.nowProvider();
-    if (occurrence == null ||
-        !occurrence.isActionable(now) ||
-        _actionInProgress) {
-      return;
-    }
-
-    setState(() {
-      _actionError = null;
-      _actionInProgress = true;
-    });
-    final acknowledgement = MedicationAcknowledgement(
-      medicationId: occurrence.medication.id,
-      scheduledDate: occurrence.scheduledDate,
-      acknowledgedAt: now,
+  /// Remove the medication at [index] from the list, save, and stop its
+  /// reminder notifications (both the daily one and any pending snooze).
+  Future<void> _deleteMedication(int index) async {
+    final removed = _medications[index];
+    final updated = [..._medications]..removeAt(index);
+    setState(() => _medications = updated);
+    await MedicationStorage.save(updated);
+    await NotificationService.instance.cancel(removed.id);
+    await NotificationService.instance.cancel(
+      NotificationService.snoozeNotificationId(removed.id),
     );
-    try {
-      await MedicationStateStorage.acknowledge(acknowledgement);
-    } catch (_) {
-      if (!mounted) return;
-      setState(() {
-        _actionError =
-            'The acknowledgement could not be saved. Please try again.';
-        _actionInProgress = false;
-      });
-      return;
-    }
-
-    if (occurrence.snoozedUntil != null) {
-      try {
-        await MedicationStateStorage.clearSnooze(
-          occurrence.medication.id,
-          occurrence.scheduledDate,
-        );
-      } catch (_) {
-        _notificationWarning =
-            'Marked as taken, but old snooze data could not be cleared.';
-      }
-      try {
-        final cancelled = await NotificationService.instance.cancelSnooze(
-          occurrence.medication.id,
-        );
-        if (!cancelled) {
-          _notificationWarning =
-              'An extra reminder may still appear. The app will retry cancelling it.';
-        }
-      } catch (_) {
-        _notificationWarning =
-            'Marked as taken, but an extra reminder may still appear.';
-      }
-    }
-
-    try {
-      if (!mounted) return;
-      setState(() {
-        _lastAcknowledgement = acknowledgement;
-        _lastAcknowledgedMedication = occurrence.medication;
-      });
-      await _loadState();
-    } finally {
-      if (mounted) setState(() => _actionInProgress = false);
-    }
-  }
-
-  Future<void> _snooze() async {
-    final occurrence = _occurrence;
-    final now = widget.nowProvider();
-    if (occurrence == null ||
-        !occurrence.isActionable(now) ||
-        _actionInProgress) {
-      return;
-    }
-
-    setState(() {
-      _actionError = null;
-      _actionInProgress = true;
-    });
-    final snooze = MedicationSnooze(
-      medicationId: occurrence.medication.id,
-      scheduledDate: occurrence.scheduledDate,
-      snoozeUntil: now.add(const Duration(minutes: 10)),
-    );
-    try {
-      await NotificationService.instance.scheduleSnoozeReminder(
-        medication: occurrence.medication,
-        snoozeUntil: snooze.snoozeUntil,
-      );
-      try {
-        await MedicationStateStorage.saveSnooze(snooze);
-      } catch (_) {
-        final cancelled = await NotificationService.instance.cancelSnooze(
-          occurrence.medication.id,
-        );
-        if (!cancelled) {
-          _notificationWarning =
-              'An extra reminder may appear because snooze recovery failed.';
-        }
-        rethrow;
-      }
-      if (!mounted) return;
-      await _loadState();
-    } catch (_) {
-      if (!mounted) return;
-      setState(
-        () => _actionError =
-            'The reminder could not be scheduled. Please try again.',
-      );
-    } finally {
-      if (mounted) setState(() => _actionInProgress = false);
-    }
-  }
-
-  void _continueAfterAcknowledgement() {
-    setState(() {
-      _lastAcknowledgement = null;
-      _lastAcknowledgedMedication = null;
-    });
-    _recompute(widget.nowProvider());
+    _recomputeDue();
   }
 
   @override
@@ -358,6 +422,33 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return Scaffold(
       backgroundColor: Colors.white,
       appBar: AppBar(
+        backgroundColor: const Color(0xFF1A4B8C), // deep blue = high contrast
+        foregroundColor: Colors.white,
+        title: const Text(
+          'My Medications',
+          style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold),
+        ),
+      ),
+      // Show a spinner while loading. Once loaded, stack (top to bottom):
+      // the permission warning banner (if needed), any due-medication
+      // cards, then the full medication list below.
+      body: _isLoading
+          ? const Center(child: CircularProgressIndicator())
+          : Column(
+              children: [
+                if (!_notificationsEnabled || !_exactAlarmsEnabled)
+                  _buildPermissionBanner(),
+                if (_dueMedications.isNotEmpty) _buildDueSection(),
+                Expanded(
+                  child: _medications.isEmpty
+                      ? _buildEmptyState()
+                      : _buildMedicationList(),
+                ),
+              ],
+            ),
+      // A large, labelled button so the action is obvious.
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: _openAddForm,
         backgroundColor: const Color(0xFF1A4B8C),
         foregroundColor: Colors.white,
         title: const Text(
@@ -390,249 +481,94 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildBody() {
-    if (_isLoading) {
-      return const Center(child: CircularProgressIndicator());
-    }
-    if (_storageError != null) {
-      return _StorageUnavailableState(
-        message: _storageError!,
-        onRetry: _loadState,
-        onOpenCaregiver: _openCaregiverSetup,
-      );
-    }
-    if (_lastAcknowledgement != null && _lastAcknowledgedMedication != null) {
-      return _AcknowledgementState(
-        acknowledgement: _lastAcknowledgement!,
-        medication: _lastAcknowledgedMedication!,
-        nextOccurrence: _occurrence,
-        onContinue: _continueAfterAcknowledgement,
-      );
-    }
-    if (_medications.isEmpty || _occurrence == null) {
-      return _PatientEmptyState(onOpenCaregiver: _openCaregiverSetup);
-    }
-    return _NextMedicationView(
-      occurrence: _occurrence!,
-      now: widget.nowProvider(),
-      actionError: _actionError,
-      actionInProgress: _actionInProgress,
-      onTaken: _acknowledge,
-      onSnooze: _snooze,
-    );
-  }
-}
-
-class _NextMedicationView extends StatelessWidget {
-  const _NextMedicationView({
-    required this.occurrence,
-    required this.now,
-    required this.actionError,
-    required this.actionInProgress,
-    required this.onTaken,
-    required this.onSnooze,
-  });
-
-  final MedicationOccurrence occurrence;
-  final DateTime now;
-  final String? actionError;
-  final bool actionInProgress;
-  final VoidCallback onTaken;
-  final VoidCallback onSnooze;
-
-  @override
-  Widget build(BuildContext context) {
-    final snoozedUntil = occurrence.snoozedUntil;
-    final isToday = occurrence.scheduledDate == localDateKey(now);
-    final actionable = occurrence.isActionable(now);
-    final status = snoozedUntil != null
-        ? 'SNOOZED UNTIL ${_formatClock(snoozedUntil)}'
-        : !isToday
-        ? 'NEXT: TOMORROW AT ${occurrence.medication.time}'
-        : occurrence.isDue(now)
-        ? 'REMINDER DUE'
-        : occurrence.isOverdue(now)
-        ? 'REMINDER OVERDUE · SCHEDULED ${occurrence.medication.time}'
-        : 'SCHEDULED FOR ${occurrence.medication.time}';
-
-    return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(24, 34, 24, 28),
+  /// Warning banner shown when Android has notification permission or
+  /// exact-alarm permission turned off, since reminders may then be late
+  /// or may not show up at all. Tapping a button opens the exact Settings
+  /// screen the user needs, using the `app_settings` package.
+  Widget _buildPermissionBanner() {
+    return Container(
+      width: double.infinity,
+      color: Colors.red.shade700,
+      padding: const EdgeInsets.all(16),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            status,
-            style: const TextStyle(
-              fontSize: 18,
-              fontWeight: FontWeight.bold,
-              color: Color(0xFF1A4B8C),
-              letterSpacing: 0.4,
-            ),
-          ),
-          const SizedBox(height: 18),
-          Container(
-            padding: const EdgeInsets.all(24),
-            decoration: BoxDecoration(
-              color: const Color(0xFFF5F8FC),
-              border: Border.all(color: const Color(0xFF1A4B8C), width: 2),
-              borderRadius: BorderRadius.circular(16),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Icon(
-                  Icons.medication,
-                  size: 56,
-                  color: Color(0xFF1A4B8C),
-                ),
-                const SizedBox(height: 20),
-                Text(
-                  occurrence.medication.name,
-                  style: const TextStyle(
-                    fontSize: 32,
+          const Row(
+            children: [
+              Icon(Icons.warning_amber_rounded, color: Colors.white, size: 30),
+              SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  'Reminders may not appear on time.',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 19,
                     fontWeight: FontWeight.bold,
                   ),
                 ),
-                const SizedBox(height: 8),
-                Text(
-                  occurrence.medication.dosage,
-                  style: const TextStyle(fontSize: 26),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 22),
-          const Text(
-            'Check the medication label before taking it.',
-            style: TextStyle(fontSize: 20, height: 1.35),
-          ),
-          if (actionError != null) ...[
-            const SizedBox(height: 18),
-            Text(
-              actionError!,
-              style: const TextStyle(
-                color: Colors.red,
-                fontSize: 18,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-          ],
-          if (actionable) ...[
-            const SizedBox(height: 30),
-            ElevatedButton.icon(
-              onPressed: actionInProgress ? null : onTaken,
-              style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFF1A4B8C),
-                foregroundColor: Colors.white,
-                padding: const EdgeInsets.symmetric(vertical: 20),
-              ),
-              icon: const Icon(Icons.check_circle_outline, size: 30),
-              label: const Text(
-                'I’ve taken it',
-                style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
-              ),
-            ),
-            if (snoozedUntil == null) ...[
-              const SizedBox(height: 14),
-              OutlinedButton.icon(
-                onPressed: actionInProgress ? null : onSnooze,
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: const Color(0xFF1A4B8C),
-                  side: const BorderSide(color: Color(0xFF1A4B8C), width: 2),
-                  padding: const EdgeInsets.symmetric(vertical: 20),
-                ),
-                icon: const Icon(Icons.snooze, size: 30),
-                label: const Text(
-                  'Remind me in 10 minutes',
-                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-                ),
               ),
             ],
-          ],
+          ),
+          const SizedBox(height: 14),
+          if (!_notificationsEnabled)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: _permissionButton(
+                'Turn On Notifications',
+                () => AppSettings.openAppSettings(
+                  type: AppSettingsType.notification,
+                ),
+              ),
+            ),
+          if (!_exactAlarmsEnabled)
+            _permissionButton(
+              'Turn On Exact Alarms',
+              () => AppSettings.openAppSettings(type: AppSettingsType.alarm),
+            ),
         ],
       ),
     );
   }
-}
 
-class _AcknowledgementState extends StatelessWidget {
-  const _AcknowledgementState({
-    required this.acknowledgement,
-    required this.medication,
-    required this.nextOccurrence,
-    required this.onContinue,
-  });
-
-  final MedicationAcknowledgement acknowledgement;
-  final Medication medication;
-  final MedicationOccurrence? nextOccurrence;
-  final VoidCallback onContinue;
-
-  @override
-  Widget build(BuildContext context) {
-    return Center(
-      child: SingleChildScrollView(
-        padding: const EdgeInsets.all(28),
-        child: Column(
-          children: [
-            const Icon(
-              Icons.check_circle_outline,
-              size: 96,
-              color: Color(0xFF1A4B8C),
-            ),
-            const SizedBox(height: 24),
-            const Text(
-              'Marked as taken',
-              style: TextStyle(fontSize: 30, fontWeight: FontWeight.bold),
-              textAlign: TextAlign.center,
-            ),
-            const SizedBox(height: 16),
-            Text(
-              '${medication.name} · ${medication.dosage}\n${_formatClock(acknowledgement.acknowledgedAt)}',
-              style: const TextStyle(fontSize: 21, height: 1.45),
-              textAlign: TextAlign.center,
-            ),
-            if (nextOccurrence != null) ...[
-              const SizedBox(height: 30),
-              const Divider(),
-              const SizedBox(height: 18),
-              const Text(
-                'Next reminder',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 6),
-              Text(
-                '${nextOccurrence!.medication.name} · ${nextOccurrence!.medication.time}',
-                style: const TextStyle(fontSize: 20),
-              ),
-            ],
-            const SizedBox(height: 34),
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton(
-                onPressed: onContinue,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF1A4B8C),
-                  foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(vertical: 18),
-                ),
-                child: const Text('Continue'),
-              ),
-            ),
-          ],
+  /// One large white button used inside the permission banner.
+  Widget _permissionButton(String label, VoidCallback onPressed) {
+    return SizedBox(
+      width: double.infinity,
+      child: ElevatedButton(
+        onPressed: onPressed,
+        style: ElevatedButton.styleFrom(
+          backgroundColor: Colors.white,
+          foregroundColor: Colors.red.shade700,
+          padding: const EdgeInsets.symmetric(vertical: 16),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(10),
+          ),
+        ),
+        child: Text(
+          label,
+          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
         ),
       ),
     );
   }
-}
 
-class _PatientEmptyState extends StatelessWidget {
-  const _PatientEmptyState({required this.onOpenCaregiver});
+  /// The stack of "due now" cards, one per medication that is currently due.
+  Widget _buildDueSection() {
+    return Column(
+      children: _dueMedications
+          .map(
+            (medication) => _DueMedicationCard(
+              medication: medication,
+              onTaken: () => _markTaken(medication),
+              onSnooze: () => _snooze(medication),
+            ),
+          )
+          .toList(),
+    );
+  }
 
-  final VoidCallback onOpenCaregiver;
-
-  @override
-  Widget build(BuildContext context) {
+  /// Friendly message shown when the list is empty.
+  Widget _buildEmptyState() {
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(32),
@@ -652,8 +588,12 @@ class _PatientEmptyState extends StatelessWidget {
             ),
             const SizedBox(height: 14),
             const Text(
-              'A caregiver can add the first medication and reminder.',
-              style: TextStyle(fontSize: 20, color: Colors.black54),
+              'Tap "Add Medication" below\nto add your first one.',
+              style: TextStyle(
+                fontSize: 20,
+                color: Colors.black54,
+                height: 1.5,
+              ),
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 28),
@@ -1015,8 +955,13 @@ class _CaregiverScheduleScreenState extends State<CaregiverScheduleScreen> {
       );
     }
     return ListView.separated(
-      padding: const EdgeInsets.fromLTRB(16, 20, 16, 110),
-      itemCount: _medications.length + 1,
+      padding: const EdgeInsets.fromLTRB(
+        16,
+        20,
+        16,
+        100,
+      ), // bottom padding clears the FAB
+      itemCount: _medications.length,
       separatorBuilder: (_, _) => const SizedBox(height: 14),
       itemBuilder: (context, index) {
         if (index == 0) {
@@ -1081,8 +1026,26 @@ class _MedicationCard extends StatelessWidget {
                   Text(medication.dosage, style: const TextStyle(fontSize: 18)),
                   const SizedBox(height: 6),
                   Text(
-                    medication.time,
-                    style: const TextStyle(fontSize: 18, color: Colors.black54),
+                    medication.dosage,
+                    style: const TextStyle(fontSize: 18, color: Colors.black87),
+                  ),
+                  const SizedBox(height: 6),
+                  Row(
+                    children: [
+                      const Icon(
+                        Icons.access_time,
+                        size: 18,
+                        color: Colors.black54,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        medication.time,
+                        style: const TextStyle(
+                          fontSize: 18,
+                          color: Colors.black54,
+                        ),
+                      ),
+                    ],
                   ),
                 ],
               ),
@@ -1094,7 +1057,7 @@ class _MedicationCard extends StatelessWidget {
                 color: Colors.red,
                 size: 30,
               ),
-              tooltip: 'Delete ${medication.name}',
+              tooltip: 'Delete',
               padding: const EdgeInsets.all(12),
             ),
           ],
@@ -1104,6 +1067,142 @@ class _MedicationCard extends StatelessWidget {
   }
 }
 
+// ─── Due Medication Card ───────────────────────────────────────────────────
+
+/// The prominent card shown at the top of the home screen when a medication
+/// is due: its scheduled time has arrived and it hasn't been taken (or
+/// snoozed) yet today. Uses a bold amber/orange colour so it stands out
+/// clearly from the ordinary medication list below.
+class _DueMedicationCard extends StatelessWidget {
+  const _DueMedicationCard({
+    required this.medication,
+    required this.onTaken,
+    required this.onSnooze,
+  });
+
+  final Medication medication;
+  final VoidCallback onTaken;
+  final VoidCallback onSnooze;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      color: const Color(0xFFFFF4E5), // soft amber — stands out, stays readable
+      elevation: 5,
+      margin: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(16),
+        side: const BorderSide(color: Color(0xFFCC7A00), width: 2),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Heading
+            Row(
+              children: [
+                const Icon(
+                  Icons.notifications_active,
+                  color: Color(0xFFCC7A00),
+                  size: 32,
+                ),
+                const SizedBox(width: 10),
+                const Text(
+                  'Medication Due',
+                  style: TextStyle(
+                    fontSize: 22,
+                    fontWeight: FontWeight.bold,
+                    color: Color(0xFF8A4B00),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+
+            // Name and dosage
+            Text(
+              medication.name,
+              style: const TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              medication.dosage,
+              style: const TextStyle(fontSize: 20, color: Colors.black87),
+            ),
+            const SizedBox(height: 16),
+
+            // Safety reminder
+            const Row(
+              children: [
+                Icon(Icons.info_outline, size: 22, color: Colors.black54),
+                SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Check the medication label before taking it',
+                    style: TextStyle(
+                      fontSize: 17,
+                      color: Colors.black87,
+                      fontStyle: FontStyle.italic,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 22),
+
+            // "I've taken it" — big, green, primary action.
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton.icon(
+                onPressed: onTaken,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.green.shade700,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 22),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+                icon: const Icon(Icons.check_circle, size: 28),
+                label: const Text(
+                  "I've taken it",
+                  style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+
+            // "Remind me in 10 minutes" — big, secondary action.
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: onSnooze,
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: const Color(0xFF1A4B8C),
+                  side: const BorderSide(color: Color(0xFF1A4B8C), width: 2),
+                  padding: const EdgeInsets.symmetric(vertical: 20),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+                icon: const Icon(Icons.snooze, size: 26),
+                label: const Text(
+                  'Remind Me in 10 Minutes',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ─── Add Medication Screen ─────────────────────────────────────────────────
+
+/// A form screen for entering a new medication.
 class AddMedicationScreen extends StatefulWidget {
   const AddMedicationScreen({super.key});
 
@@ -1129,7 +1228,16 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
     final picked = await showTimePicker(
       context: context,
       initialTime: _selectedTime ?? TimeOfDay.now(),
-      helpText: 'Select medication reminder time',
+      helpText: 'Select time to take medication',
+      builder: (context, child) {
+        // Make the time picker's own text a bit larger too.
+        return MediaQuery(
+          data: MediaQuery.of(
+            context,
+          ).copyWith(textScaler: const TextScaler.linear(1.2)),
+          child: child!,
+        );
+      },
     );
     if (picked != null && mounted) setState(() => _selectedTime = picked);
   }
@@ -1145,7 +1253,13 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
     if (!_formKey.currentState!.validate()) return;
     if (_selectedTime == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please select a reminder time.')),
+        const SnackBar(
+          content: Text(
+            'Please select a time.',
+            style: TextStyle(fontSize: 18),
+          ),
+          backgroundColor: Colors.red,
+        ),
       );
       return;
     }
@@ -1196,6 +1310,7 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
+              // ── Medication Name ──────────────────────────────────────────
               const Text(
                 'Medication Name',
                 style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
@@ -1236,29 +1351,36 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
                 style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
               ),
               const SizedBox(height: 10),
-              Semantics(
-                button: true,
-                label: _selectedTime == null
-                    ? 'Select reminder time'
-                    : 'Reminder time ${_formatTime(_selectedTime!)}',
-                child: InkWell(
-                  onTap: _pickTime,
-                  borderRadius: BorderRadius.circular(4),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 16,
-                      vertical: 20,
-                    ),
-                    decoration: BoxDecoration(
-                      border: Border.all(color: Colors.black54),
-                      borderRadius: BorderRadius.circular(4),
-                    ),
-                    child: Row(
-                      children: [
-                        const Icon(
-                          Icons.access_time,
-                          size: 28,
-                          color: Colors.black54,
+              // We use a GestureDetector + Container to make a tappable box
+              // that looks like a form field but opens the time picker.
+              GestureDetector(
+                onTap: _pickTime,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 20,
+                  ),
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Colors.black54),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(
+                        Icons.access_time,
+                        size: 28,
+                        color: Colors.black54,
+                      ),
+                      const SizedBox(width: 12),
+                      Text(
+                        _selectedTime == null
+                            ? 'Tap to select a time'
+                            : _formatTime(_selectedTime!),
+                        style: TextStyle(
+                          fontSize: 20,
+                          color: _selectedTime == null
+                              ? Colors.black45
+                              : Colors.black87,
                         ),
                         const SizedBox(width: 12),
                         Text(
@@ -1284,6 +1406,9 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
                   backgroundColor: const Color(0xFF1A4B8C),
                   foregroundColor: Colors.white,
                   padding: const EdgeInsets.symmetric(vertical: 20),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
                 ),
                 icon: _isPreparing
                     ? const SizedBox(

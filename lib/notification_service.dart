@@ -60,15 +60,13 @@ class NotificationService {
   ///   Android is still allowed to *delay* the reminder by several minutes
   ///   (or longer) to save battery, which isn't good enough for a
   ///   medication reminder.
-  Future<bool> requestPermissions() async {
+  Future<void> requestPermissions() async {
     final androidPlugin = _plugin
         .resolvePlatformSpecificImplementation<
           AndroidFlutterLocalNotificationsPlugin
         >();
-    if (androidPlugin == null) return false;
-    final notifications = await androidPlugin.requestNotificationsPermission();
-    final exactAlarms = await androidPlugin.requestExactAlarmsPermission();
-    return notifications != false && exactAlarms != false;
+    await androidPlugin?.requestNotificationsPermission();
+    await androidPlugin?.requestExactAlarmsPermission();
   }
 
   /// Schedules a notification that fires every day at [hour]:[minute]
@@ -109,42 +107,25 @@ class NotificationService {
     );
   }
 
-  /// Replaces all stored daily alarms after a legacy data migration so the
-  /// Android notification ids and displayed schedule stay in sync.
-  Future<void> reconcileMedicationReminders(
-    Iterable<Medication> medications,
-  ) async {
-    for (final medication in medications) {
-      try {
-        await scheduleDailyMedicationReminder(
-          id: medication.id,
-          medicationName: medication.name,
-          dosage: medication.dosage,
-          hour: medication.hour,
-          minute: medication.minute,
-        );
-        await ReminderRetryStorage.remove(medication.id);
-      } catch (_) {
-        try {
-          await ReminderRetryStorage.add(medication.id);
-        } catch (_) {
-          // The UI still reports that migrated reminders need attention.
-        }
-      }
-    }
-  }
-
-  /// Schedules one extra reminder for a medication occurrence without
-  /// changing its normal daily reminder.
-  Future<void> scheduleSnoozeReminder({
-    required Medication medication,
-    required DateTime snoozeUntil,
+  /// Schedules a single, one-time reminder that fires at [fireAt] — used
+  /// for the "Remind me in 10 minutes" snooze button. Unlike
+  /// `scheduleDailyMedicationReminder`, this does NOT repeat: it has no
+  /// `matchDateTimeComponents`, so it fires once and is done.
+  ///
+  /// [id] should be a different notification id than the medication's daily
+  /// reminder (see `snoozeNotificationId` below), so snoozing never cancels
+  /// or overwrites the daily reminder.
+  Future<void> scheduleOneOffReminder({
+    required int id,
+    required String medicationName,
+    required String dosage,
+    required DateTime fireAt,
   }) async {
     await _plugin.zonedSchedule(
-      id: medication.id + snoozeNotificationIdOffset,
-      title: 'Medication reminder',
-      body: '${medication.name} - ${medication.dosage}',
-      scheduledDate: tz.TZDateTime.from(snoozeUntil, tz.local),
+      id: id,
+      title: 'Reminder: time for your medication',
+      body: '$medicationName - $dosage',
+      scheduledDate: tz.TZDateTime.from(fireAt, tz.local),
       notificationDetails: const NotificationDetails(
         android: AndroidNotificationDetails(
           _channelId,
@@ -162,42 +143,34 @@ class NotificationService {
   /// when the user deletes that medication).
   Future<void> cancel(int id) => _plugin.cancel(id: id);
 
-  /// Cancels a snooze. Returns false if Android rejected the cancellation;
-  /// the id is then persisted for another attempt on the next app launch.
-  Future<bool> cancelSnooze(int medicationId) =>
-      _cancelOrQueue(medicationId + snoozeNotificationIdOffset);
+  /// A medication's daily reminder and its "snoozed" one-off reminder must
+  /// use different notification ids, otherwise scheduling one would
+  /// silently replace the other. This derives a snooze id from the
+  /// medication's own id by shifting it into a range the daily ids never
+  /// use (daily ids are kept under 1,000,000,000 — see `Medication`'s id
+  /// generation in main.dart). The result still safely fits Android's
+  /// 32-bit notification id limit (max ~2.14 billion).
+  static int snoozeNotificationId(int medicationId) =>
+      medicationId + 1000000000;
 
-  /// Cancels both recurring and snoozed reminders for a deleted medication.
-  Future<bool> cancelAllForMedication(int medicationId) async {
-    final recurring = await _cancelOrQueue(medicationId);
-    final snooze = await _cancelOrQueue(
-      medicationId + snoozeNotificationIdOffset,
-    );
-    return recurring && snooze;
+  /// Whether the app currently has permission to show notifications at all.
+  /// Used to show the "reminders may not appear" warning banner.
+  Future<bool> areNotificationsEnabled() async {
+    final androidPlugin = _plugin
+        .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin
+        >();
+    return await androidPlugin?.areNotificationsEnabled() ?? true;
   }
 
-  Future<void> retryPendingCancellations() async {
-    final pending = await PendingNotificationCancellationStorage.load();
-    final completed = <int>[];
-    for (final id in pending) {
-      try {
-        await _plugin.cancel(id: id);
-        completed.add(id);
-      } catch (_) {
-        // Keep the id for the next launch.
-      }
-    }
-    await PendingNotificationCancellationStorage.removeSuccessful(completed);
-  }
-
-  Future<bool> _cancelOrQueue(int id) async {
-    try {
-      await _plugin.cancel(id: id);
-      return true;
-    } catch (_) {
-      await PendingNotificationCancellationStorage.enqueue(id);
-      return false;
-    }
+  /// Whether the app currently has permission to schedule *exact* alarms.
+  /// Without this, Android may delay reminders by several minutes.
+  Future<bool> canScheduleExactAlarms() async {
+    final androidPlugin = _plugin
+        .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin
+        >();
+    return await androidPlugin?.canScheduleExactNotifications() ?? true;
   }
 
   /// Returns the next moment (today or tomorrow) that matches [hour]:[minute].
