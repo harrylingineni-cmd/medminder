@@ -8,7 +8,8 @@
       "Bash(flutter config *)",
       "Bash(flutter analyze *)",
       "Bash(grep -n 'Future<void> cancel' -A 10 __TRACKED_VAR__/lib/src/flutter_local_notifications_plugin.dart)",
-      "Bash(flutter build *)"
+      "Bash(flutter build *)",
+      "Bash(git fetch *)"
     ]
   }
 }
