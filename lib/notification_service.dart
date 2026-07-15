@@ -24,6 +24,38 @@ class NotificationService {
   static const _channelDescription =
       'Reminders to take your medication at the scheduled time';
 
+  // ── Notification id "bands" ────────────────────────────────────────────
+  //
+  // Every scheduled notification needs a unique numeric id. We build ids for
+  // the daily reminder, the 10-minute snooze, and the repeat-until-confirmed
+  // chain all from a single medication id, by shifting each kind into its
+  // own non-overlapping band of numbers:
+  //
+  //   daily reminder id        = medicationId                (band 0)
+  //   snooze reminder id       = medicationId + 1 * idSpace  (band 1)
+  //   repeat reminder #1 id    = medicationId + 2 * idSpace  (band 2)
+  //   repeat reminder #2 id    = medicationId + 3 * idSpace  (band 3)
+  //   ...and so on, one band per repeat.
+  //
+  // `idSpace` must be bigger than the largest possible medication id (see
+  // `Medication`'s id generation in main.dart, which uses this same
+  // constant) so the bands never overlap, and small enough that even the
+  // highest band stays under Android's 32-bit notification id limit
+  // (about 2.14 billion). main.dart uses this same constant when it
+  // generates a new medication's id, so the two files can never drift out
+  // of sync.
+  static const int idSpace = 100000000; // 100 million
+
+  // How often the "please confirm" reminder repeats once a dose is due.
+  static const int repeatIntervalMinutes = 5;
+
+  // The longest reminder window we offer (see AddMedicationScreen) divided
+  // by the repeat interval, i.e. the most repeat notifications any one
+  // medication could ever need at once. Used only to know how many ids to
+  // try cancelling — cancelling an id that was never scheduled is a safe
+  // no-op, so it's fine for this to be a generous upper bound.
+  static const int _maxRepeatSlots = 60 ~/ repeatIntervalMinutes;
+
   /// Must be called once before any scheduling happens — we call this from
   /// main() before runApp().
   Future<void> init() async {
@@ -133,19 +165,98 @@ class NotificationService {
     );
   }
 
+  /// Schedules the "please confirm you've taken it" repeat chain for one
+  /// medication: a one-off notification every [repeatIntervalMinutes]
+  /// minutes, starting [repeatIntervalMinutes] minutes after [anchorTime]
+  /// (the moment the *original* daily reminder fires), and continuing until
+  /// [reminderWindowMinutes] minutes have passed.
+  ///
+  /// Each repeat gets its own fixed id (see `repeatNotificationId`), so
+  /// calling this again later — e.g. because the user re-opened the app —
+  /// simply *overwrites* the same notifications with the same fire times
+  /// instead of creating new, duplicate ones. That's what keeps repeats
+  /// from stacking up.
+  ///
+  /// Any repeat whose fire time has already passed is explicitly cancelled
+  /// instead of (re)scheduled, since `zonedSchedule` requires a future time.
+  /// This is also what makes the repeats "stop on their own" once the
+  /// reminder window has elapsed: we simply never schedule anything past
+  /// `anchorTime + reminderWindowMinutes`.
+  Future<void> scheduleRepeatReminders({
+    required int medicationId,
+    required String medicationName,
+    required String dosage,
+    required DateTime anchorTime,
+    required int reminderWindowMinutes,
+  }) async {
+    final now = DateTime.now();
+    final repeatCount = reminderWindowMinutes ~/ repeatIntervalMinutes;
+
+    for (var slot = 1; slot <= repeatCount; slot++) {
+      final id = repeatNotificationId(medicationId, slot);
+      final fireAt = anchorTime.add(
+        Duration(minutes: repeatIntervalMinutes * slot),
+      );
+
+      if (fireAt.isBefore(now)) {
+        // This slot's moment is in the past (e.g. the app was closed and
+        // only reopened after it would have fired) — nothing to schedule,
+        // and cancel it in case an older schedule for it still exists.
+        await cancel(id);
+        continue;
+      }
+
+      await _plugin.zonedSchedule(
+        id: id,
+        title: 'Reminder: please confirm your medication',
+        body: '$medicationName - $dosage - still waiting for you to confirm',
+        scheduledDate: tz.TZDateTime.from(fireAt, tz.local),
+        notificationDetails: const NotificationDetails(
+          android: AndroidNotificationDetails(
+            _channelId,
+            _channelName,
+            channelDescription: _channelDescription,
+            importance: Importance.max,
+            priority: Priority.high,
+          ),
+        ),
+        androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+      );
+    }
+  }
+
+  /// Cancels every repeat reminder that could possibly be pending for
+  /// [medicationId] — called when the user confirms "I've taken it" or
+  /// snoozes, so the repeats stop immediately instead of continuing to fire.
+  ///
+  /// It loops over every *possible* repeat slot rather than just the ones
+  /// we know we scheduled, because cancelling an id Android doesn't
+  /// recognise is a harmless no-op — that keeps this simple and safe even
+  /// if the reminder window changed since the chain was first scheduled.
+  Future<void> cancelRepeatReminders(int medicationId) async {
+    for (var slot = 1; slot <= _maxRepeatSlots; slot++) {
+      await cancel(repeatNotificationId(medicationId, slot));
+    }
+  }
+
   /// Cancels the reminder previously scheduled with this [id] (for example
   /// when the user deletes that medication).
   Future<void> cancel(int id) => _plugin.cancel(id: id);
 
-  /// A medication's daily reminder and its "snoozed" one-off reminder must
-  /// use different notification ids, otherwise scheduling one would
-  /// silently replace the other. This derives a snooze id from the
-  /// medication's own id by shifting it into a range the daily ids never
-  /// use (daily ids are kept under 1,000,000,000 — see `Medication`'s id
-  /// generation in main.dart). The result still safely fits Android's
-  /// 32-bit notification id limit (max ~2.14 billion).
-  static int snoozeNotificationId(int medicationId) =>
-      medicationId + 1000000000;
+  /// A medication's daily reminder, its "snoozed" one-off reminder, and its
+  /// repeat-until-confirmed chain must all use different notification ids,
+  /// otherwise scheduling one would silently replace another. This derives
+  /// the snooze id from the medication's own id by shifting it into the
+  /// next `idSpace`-sized band (see the "Notification id bands" comment
+  /// above `idSpace`).
+  static int snoozeNotificationId(int medicationId) => medicationId + idSpace;
+
+  /// Derives the id for repeat number [slot] (1 = the first repeat, 5
+  /// minutes after the original reminder; 2 = ten minutes after; and so
+  /// on), by shifting the medication id into band `1 + slot` (band 0 is the
+  /// daily reminder, band 1 is the snooze — see `idSpace` above).
+  static int repeatNotificationId(int medicationId, int slot) =>
+      medicationId + (1 + slot) * idSpace;
 
   /// Whether the app currently has permission to show notifications at all.
   /// Used to show the "reminders may not appear" warning banner.

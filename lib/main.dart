@@ -5,6 +5,12 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart'; // For local storage
 import 'due_status_storage.dart'; // Tracks "taken today" / "snoozed" per medication
 import 'notification_service.dart'; // Schedules the medication reminders
+import 'welcome_screen.dart'; // First-launch welcome / disclaimer screen
+
+// The SharedPreferences key used to remember "the user has already seen the
+// welcome/disclaimer screen". Once this is set to true, we skip straight to
+// HomeScreen on every future launch.
+const String _welcomeSeenPrefsKey = 'has_seen_welcome';
 
 // ─── App Entry Point ───────────────────────────────────────────────────────
 
@@ -33,6 +39,12 @@ class Medication {
   final int hour; // 24-hour hour (0-23), used to schedule the reminder.
   final int minute; // 0-59, used to schedule the reminder.
 
+  // How many minutes we keep sending "please confirm" repeat reminders
+  // after the dose becomes due, if the user hasn't tapped "I've taken it"
+  // (or snoozed) yet. Chosen by the user when adding/editing the
+  // medication — see the reminder-window selector in AddMedicationScreen.
+  final int reminderWindowMinutes;
+
   Medication({
     required this.id,
     required this.name,
@@ -40,6 +52,7 @@ class Medication {
     required this.time,
     required this.hour,
     required this.minute,
+    this.reminderWindowMinutes = 30,
   });
 
   /// Turn this medication into a Map so it can be saved as JSON text.
@@ -50,21 +63,29 @@ class Medication {
     'time': time,
     'hour': hour,
     'minute': minute,
+    'reminderWindowMinutes': reminderWindowMinutes,
   };
 
   /// Recreate a Medication from a Map that was loaded out of storage.
   factory Medication.fromJson(Map<String, dynamic> json) => Medication(
     // Older saved medications (from before reminders were added) won't
     // have an id/hour/minute yet, so fall back to sensible defaults
-    // rather than crashing.
+    // rather than crashing. New ids are kept under `NotificationService
+    // .idSpace` so the daily/snooze/repeat notification id "bands"
+    // derived from them (see notification_service.dart) never collide.
     id:
         json['id'] as int? ??
-        DateTime.now().millisecondsSinceEpoch.remainder(1000000000),
+        DateTime.now().millisecondsSinceEpoch.remainder(
+          NotificationService.idSpace,
+        ),
     name: json['name'] as String,
     dosage: json['dosage'] as String,
     time: json['time'] as String,
     hour: json['hour'] as int? ?? 8,
     minute: json['minute'] as int? ?? 0,
+    // Older saved medications (from before repeat reminders existed)
+    // won't have this field yet, so default to 30 minutes.
+    reminderWindowMinutes: json['reminderWindowMinutes'] as int? ?? 30,
   );
 }
 
@@ -127,8 +148,60 @@ class MedTrackerApp extends StatelessWidget {
         ),
         useMaterial3: true,
       ),
-      home: const HomeScreen(),
+      home: const AppEntryPoint(),
     );
+  }
+}
+
+// ─── App Entry Point ───────────────────────────────────────────────────────
+
+/// Decides which screen to show first: the welcome/disclaimer screen (only
+/// on the very first launch) or straight to HomeScreen (every launch after
+/// that). Reading the "have we shown it before?" flag from SharedPreferences
+/// is asynchronous, so this widget shows a brief loading spinner while it
+/// checks.
+class AppEntryPoint extends StatefulWidget {
+  const AppEntryPoint({super.key});
+
+  @override
+  State<AppEntryPoint> createState() => _AppEntryPointState();
+}
+
+class _AppEntryPointState extends State<AppEntryPoint> {
+  // Null while we're still checking storage; true/false once we know.
+  bool? _hasSeenWelcome;
+
+  @override
+  void initState() {
+    super.initState();
+    _checkIfWelcomeWasSeen();
+  }
+
+  Future<void> _checkIfWelcomeWasSeen() async {
+    final prefs = await SharedPreferences.getInstance();
+    final seen = prefs.getBool(_welcomeSeenPrefsKey) ?? false;
+    setState(() => _hasSeenWelcome = seen);
+  }
+
+  /// Called when the user taps "I Understand — Get Started" on the welcome
+  /// screen. Saves the flag so it never shows automatically again, then
+  /// swaps to HomeScreen.
+  Future<void> _completeWelcome() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_welcomeSeenPrefsKey, true);
+    setState(() => _hasSeenWelcome = true);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_hasSeenWelcome == null) {
+      // Still reading from storage — show a brief spinner.
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+    if (_hasSeenWelcome == false) {
+      return WelcomeScreen(isFirstLaunch: true, onContinue: _completeWelcome);
+    }
+    return const HomeScreen();
   }
 }
 
@@ -194,6 +267,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (state == AppLifecycleState.resumed) {
       _checkPermissions();
       _recomputeDue();
+      _rescheduleAllReminderChains();
     }
   }
 
@@ -206,6 +280,72 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _isLoading = false;
     });
     _recomputeDue();
+    await _rescheduleAllReminderChains();
+  }
+
+  /// (Re)schedules the "please confirm" repeat chain for every medication.
+  /// Safe to call as often as we like — see `_scheduleReminderChain` for
+  /// why this never creates duplicate or stacked-up notifications.
+  ///
+  /// We call this whenever the app starts or comes back to the foreground,
+  /// because that's the only time our Dart code actually runs to figure out
+  /// "what's the next dose, and how much of its repeat window is left?" —
+  /// the repeat notifications themselves keep firing while the app is
+  /// closed (that's the whole point of exact-alarm scheduling), but nothing
+  /// re-plans *tomorrow's* chain until the app is opened again. In
+  /// practice, opening the app once a day (e.g. to check the medication
+  /// list) is enough to keep every future day's chain freshly scheduled.
+  Future<void> _rescheduleAllReminderChains() async {
+    for (final medication in _medications) {
+      await _scheduleReminderChain(medication);
+    }
+  }
+
+  /// Schedules (or re-schedules) the repeat-until-confirmed chain for a
+  /// single [medication], anchored to whichever occurrence of its daily
+  /// reminder is "next":
+  ///   - If it hasn't been taken yet today, the chain is anchored to
+  ///     *today's* scheduled time — this covers both "not due yet" (the
+  ///     chain is scheduled ahead of time, ready to go) and "currently due,
+  ///     mid-repeat-cycle" (re-scheduling with the same ids is harmless and
+  ///     just re-confirms what should already be pending).
+  ///   - If it has already been taken today, the chain is anchored to
+  ///     *tomorrow's* scheduled time instead, ready for the next day.
+  ///   - If the user is currently within an active snooze, we don't touch
+  ///     the chain at all — it was already cancelled when they snoozed (see
+  ///     `_snooze`), and there's nothing useful to schedule until the
+  ///     snooze itself fires or the day rolls over.
+  Future<void> _scheduleReminderChain(Medication medication) async {
+    final status = _dueStatus[medication.id];
+    final now = DateTime.now();
+
+    final snoozeUntilMillis = status?.snoozeUntilMillis;
+    if (snoozeUntilMillis != null) {
+      final snoozeUntil = DateTime.fromMillisecondsSinceEpoch(
+        snoozeUntilMillis,
+      );
+      if (now.isBefore(snoozeUntil)) return; // Currently snoozed — skip.
+    }
+
+    var anchor = DateTime(
+      now.year,
+      now.month,
+      now.day,
+      medication.hour,
+      medication.minute,
+    );
+    final takenToday = status?.takenDate == DueStatusStorage.todayString(now);
+    if (takenToday) {
+      anchor = anchor.add(const Duration(days: 1));
+    }
+
+    await NotificationService.instance.scheduleRepeatReminders(
+      medicationId: medication.id,
+      medicationName: medication.name,
+      dosage: medication.dosage,
+      anchorTime: anchor,
+      reminderWindowMinutes: medication.reminderWindowMinutes,
+    );
   }
 
   /// Ask Android whether notifications / exact alarms are currently allowed,
@@ -242,21 +382,26 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   /// "I've taken it" — marks the dose as done for today, cancels any
-  /// pending snooze reminder for it, and removes its due card.
+  /// pending snooze reminder AND the whole repeat-until-confirmed chain for
+  /// it (so it stops pinging every 5 minutes), and removes its due card.
   Future<void> _markTaken(Medication medication) async {
     await DueStatusStorage.markTakenToday(medication.id);
     await NotificationService.instance.cancel(
       NotificationService.snoozeNotificationId(medication.id),
     );
+    await NotificationService.instance.cancelRepeatReminders(medication.id);
     _dueStatus = await DueStatusStorage.loadAll();
     _recomputeDue();
   }
 
-  /// "Remind me in 10 minutes" — hides the due card for now, and schedules
-  /// a one-time reminder notification 10 minutes from now.
+  /// "Remind me in 10 minutes" — hides the due card for now, cancels the
+  /// repeat-until-confirmed chain (snoozing counts as "dealt with" for now,
+  /// so the every-5-minutes pings should stop), and schedules a one-time
+  /// reminder notification 10 minutes from now.
   Future<void> _snooze(Medication medication) async {
     final snoozeUntil = DateTime.now().add(const Duration(minutes: 10));
     await DueStatusStorage.snooze(medication.id, snoozeUntil);
+    await NotificationService.instance.cancelRepeatReminders(medication.id);
     await NotificationService.instance.scheduleOneOffReminder(
       id: NotificationService.snoozeNotificationId(medication.id),
       medicationName: medication.name,
@@ -281,7 +426,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       setState(() => _medications = updated);
       await MedicationStorage.save(updated); // Persist to device storage
 
-      // Schedule a daily reminder that fires at this medication's time.
+      // Schedule a daily reminder that fires at this medication's time,
+      // plus its repeat-until-confirmed chain for the next time it's due.
       await NotificationService.instance.scheduleDailyMedicationReminder(
         id: newMed.id,
         medicationName: newMed.name,
@@ -289,12 +435,47 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         hour: newMed.hour,
         minute: newMed.minute,
       );
+      await _scheduleReminderChain(newMed);
       _recomputeDue();
     }
   }
 
-  /// Remove the medication at [index] from the list, save, and stop its
-  /// reminder notifications (both the daily one and any pending snooze).
+  /// Navigate to the Add Medication screen pre-filled with [medication]'s
+  /// details, and apply whatever the user saves back over the original.
+  Future<void> _editMedication(int index) async {
+    final original = _medications[index];
+    final updatedMed = await Navigator.push<Medication>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => AddMedicationScreen(existing: original),
+      ),
+    );
+    if (updatedMed == null) return; // User tapped Cancel / went back.
+
+    final updated = [..._medications];
+    updated[index] = updatedMed;
+    setState(() => _medications = updated);
+    await MedicationStorage.save(updated);
+
+    // The time or reminder window may have changed, so cancel the old
+    // repeat chain and re-schedule everything from scratch. The daily and
+    // snooze ids stay the same (same medication id), so re-scheduling the
+    // daily reminder simply overwrites the old one.
+    await NotificationService.instance.cancelRepeatReminders(updatedMed.id);
+    await NotificationService.instance.scheduleDailyMedicationReminder(
+      id: updatedMed.id,
+      medicationName: updatedMed.name,
+      dosage: updatedMed.dosage,
+      hour: updatedMed.hour,
+      minute: updatedMed.minute,
+    );
+    await _scheduleReminderChain(updatedMed);
+    _recomputeDue();
+  }
+
+  /// Remove the medication at [index] from the list, save, and stop all of
+  /// its reminder notifications (daily, any pending snooze, and the whole
+  /// repeat-until-confirmed chain).
   Future<void> _deleteMedication(int index) async {
     final removed = _medications[index];
     final updated = [..._medications]..removeAt(index);
@@ -304,6 +485,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await NotificationService.instance.cancel(
       NotificationService.snoozeNotificationId(removed.id),
     );
+    await NotificationService.instance.cancelRepeatReminders(removed.id);
     _recomputeDue();
   }
 
@@ -318,6 +500,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           'My Medications',
           style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold),
         ),
+        actions: [
+          // Lets the user re-read the welcome/disclaimer screen and privacy
+          // policy link at any time, not just on first launch.
+          IconButton(
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (_) => WelcomeScreen(
+                  isFirstLaunch: false,
+                  onContinue: () => Navigator.pop(context),
+                ),
+              ),
+            ),
+            icon: const Icon(Icons.info_outline, size: 28),
+            tooltip: 'About / Privacy',
+          ),
+        ],
       ),
       // Show a spinner while loading. Once loaded, stack (top to bottom):
       // the permission warning banner (if needed), any due-medication
@@ -486,6 +685,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         return _MedicationCard(
           medication: _medications[index],
           onDelete: () => _deleteMedication(index),
+          onTap: () => _editMedication(index),
         );
       },
     );
@@ -495,85 +695,109 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 // ─── Medication Card ───────────────────────────────────────────────────────
 
 /// A single card in the medication list showing name, dosage, and time.
+/// Tapping anywhere on the card (other than the delete button) opens it for
+/// editing, including its reminder window.
 class _MedicationCard extends StatelessWidget {
-  const _MedicationCard({required this.medication, required this.onDelete});
+  const _MedicationCard({
+    required this.medication,
+    required this.onDelete,
+    required this.onTap,
+  });
 
   final Medication medication;
   final VoidCallback onDelete;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
     return Card(
       elevation: 3,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 18),
-        child: Row(
-          children: [
-            // Blue icon badge on the left
-            Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: const Color(0xFFE3EBF8),
-                borderRadius: BorderRadius.circular(12),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(16),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 18),
+          child: Row(
+            children: [
+              // Blue icon badge on the left
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFE3EBF8),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: const Icon(
+                  Icons.medication,
+                  color: Color(0xFF1A4B8C),
+                  size: 36,
+                ),
               ),
-              child: const Icon(
-                Icons.medication,
-                color: Color(0xFF1A4B8C),
-                size: 36,
-              ),
-            ),
-            const SizedBox(width: 16),
-            // Medication details in the middle
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    medication.name,
-                    style: const TextStyle(
-                      fontSize: 22,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  const SizedBox(height: 6),
-                  Text(
-                    medication.dosage,
-                    style: const TextStyle(fontSize: 18, color: Colors.black87),
-                  ),
-                  const SizedBox(height: 6),
-                  Row(
-                    children: [
-                      const Icon(
-                        Icons.access_time,
-                        size: 18,
-                        color: Colors.black54,
+              const SizedBox(width: 16),
+              // Medication details in the middle
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      medication.name,
+                      style: const TextStyle(
+                        fontSize: 22,
+                        fontWeight: FontWeight.bold,
                       ),
-                      const SizedBox(width: 4),
-                      Text(
-                        medication.time,
-                        style: const TextStyle(
-                          fontSize: 18,
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      medication.dosage,
+                      style: const TextStyle(
+                        fontSize: 18,
+                        color: Colors.black87,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        const Icon(
+                          Icons.access_time,
+                          size: 18,
                           color: Colors.black54,
                         ),
+                        const SizedBox(width: 4),
+                        Text(
+                          medication.time,
+                          style: const TextStyle(
+                            fontSize: 18,
+                            color: Colors.black54,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'Reminds every 5 min for '
+                      '${medication.reminderWindowMinutes} min if missed',
+                      style: const TextStyle(
+                        fontSize: 14,
+                        color: Colors.black45,
+                        fontStyle: FontStyle.italic,
                       ),
-                    ],
-                  ),
-                ],
+                    ),
+                  ],
+                ),
               ),
-            ),
-            // Delete button on the right — large tap target
-            IconButton(
-              onPressed: onDelete,
-              icon: const Icon(
-                Icons.delete_outline,
-                color: Colors.red,
-                size: 30,
+              // Delete button on the right — large tap target
+              IconButton(
+                onPressed: onDelete,
+                icon: const Icon(
+                  Icons.delete_outline,
+                  color: Colors.red,
+                  size: 30,
+                ),
+                tooltip: 'Delete',
+                padding: const EdgeInsets.all(12),
               ),
-              tooltip: 'Delete',
-              padding: const EdgeInsets.all(12),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
@@ -715,9 +939,13 @@ class _DueMedicationCard extends StatelessWidget {
 
 // ─── Add Medication Screen ─────────────────────────────────────────────────
 
-/// A form screen for entering a new medication.
+/// A form screen for entering a new medication, or editing an existing one
+/// if [existing] is passed in.
 class AddMedicationScreen extends StatefulWidget {
-  const AddMedicationScreen({super.key});
+  const AddMedicationScreen({super.key, this.existing});
+
+  /// When editing, the medication being edited. Null when adding a new one.
+  final Medication? existing;
 
   @override
   State<AddMedicationScreen> createState() => _AddMedicationScreenState();
@@ -732,6 +960,29 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
 
   // Null until the user picks a time from the time picker.
   TimeOfDay? _selectedTime;
+
+  // How many minutes to keep sending "please confirm" repeat reminders if
+  // the dose isn't confirmed. 30 minutes is a reasonable default.
+  int _selectedWindowMinutes = 30;
+
+  // The reminder-window choices offered to the user, in minutes.
+  static const _windowOptions = [15, 30, 60];
+
+  bool get _isEditing => widget.existing != null;
+
+  @override
+  void initState() {
+    super.initState();
+    // If we're editing an existing medication, pre-fill every field with
+    // its current values so the user only has to change what they want to.
+    final existing = widget.existing;
+    if (existing != null) {
+      _nameController.text = existing.name;
+      _dosageController.text = existing.dosage;
+      _selectedTime = TimeOfDay(hour: existing.hour, minute: existing.minute);
+      _selectedWindowMinutes = existing.reminderWindowMinutes;
+    }
+  }
 
   @override
   void dispose() {
@@ -762,6 +1013,33 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
     }
   }
 
+  /// One big tappable button for a single reminder-window choice (e.g.
+  /// "30 min"). Highlighted blue when it's the currently selected option.
+  Widget _buildWindowOption(int minutes) {
+    final selected = _selectedWindowMinutes == minutes;
+    return Expanded(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: OutlinedButton(
+          onPressed: () => setState(() => _selectedWindowMinutes = minutes),
+          style: OutlinedButton.styleFrom(
+            backgroundColor: selected ? const Color(0xFF1A4B8C) : Colors.white,
+            foregroundColor: selected ? Colors.white : const Color(0xFF1A4B8C),
+            side: const BorderSide(color: Color(0xFF1A4B8C), width: 2),
+            padding: const EdgeInsets.symmetric(vertical: 18),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(10),
+            ),
+          ),
+          child: Text(
+            '$minutes min',
+            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          ),
+        ),
+      ),
+    );
+  }
+
   /// Convert a TimeOfDay to a human-friendly string like "8:30 AM".
   String _formatTime(TimeOfDay time) {
     final hour = time.hourOfPeriod == 0 ? 12 : time.hourOfPeriod;
@@ -789,19 +1067,29 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
       return;
     }
 
-    // Send the new medication back to HomeScreen.
+    // Send the new (or edited) medication back to HomeScreen. When editing,
+    // keep the original id so it keeps using the same notification ids
+    // (the daily reminder, snooze, and repeat chain all get overwritten in
+    // place rather than duplicated).
     Navigator.pop(
       context,
       Medication(
-        // Android notification ids must fit in a 32-bit int, so we can't
-        // use the full millisecondsSinceEpoch value directly — this keeps
-        // it small while still being unique enough for a simple app.
-        id: DateTime.now().millisecondsSinceEpoch.remainder(1000000000),
+        id:
+            widget.existing?.id ??
+            // Android notification ids must fit in a 32-bit int, and every
+            // other notification for this medication is derived from this
+            // id by adding multiples of `NotificationService.idSpace` (see
+            // that constant's comment) — so the id itself must stay well
+            // under that to leave room for all of them.
+            DateTime.now().millisecondsSinceEpoch.remainder(
+              NotificationService.idSpace,
+            ),
         name: _nameController.text.trim(),
         dosage: _dosageController.text.trim(),
         time: _formatTime(_selectedTime!),
         hour: _selectedTime!.hour,
         minute: _selectedTime!.minute,
+        reminderWindowMinutes: _selectedWindowMinutes,
       ),
     );
   }
@@ -813,9 +1101,9 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
       appBar: AppBar(
         backgroundColor: const Color(0xFF1A4B8C),
         foregroundColor: Colors.white,
-        title: const Text(
-          'Add Medication',
-          style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+        title: Text(
+          _isEditing ? 'Edit Medication' : 'Add Medication',
+          style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
         ),
       ),
       // SingleChildScrollView lets the page scroll if the keyboard pushes it up.
@@ -913,6 +1201,25 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
                   ),
                 ),
               ),
+              const SizedBox(height: 28),
+
+              // ── Reminder Window ─────────────────────────────────────────
+              const Text(
+                'Keep Reminding Me For',
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 6),
+              const Text(
+                'If you don\'t confirm, we\'ll remind you every 5 minutes '
+                'until this much time has passed.',
+                style: TextStyle(fontSize: 16, color: Colors.black54),
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: _windowOptions
+                    .map((minutes) => _buildWindowOption(minutes))
+                    .toList(),
+              ),
               const SizedBox(height: 44),
 
               // ── Save Button ───────────────────────────────────────────────
@@ -927,9 +1234,12 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
                   ),
                 ),
                 icon: const Icon(Icons.save, size: 28),
-                label: const Text(
-                  'Save Medication',
-                  style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+                label: Text(
+                  _isEditing ? 'Save Changes' : 'Save Medication',
+                  style: const TextStyle(
+                    fontSize: 22,
+                    fontWeight: FontWeight.bold,
+                  ),
                 ),
               ),
             ],

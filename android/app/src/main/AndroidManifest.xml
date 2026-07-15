@@ -84,5 +84,12 @@
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>
         </intent>
+        <!-- Required so url_launcher can find a browser to open the privacy
+             policy link on Android 11+ (API 30+), which otherwise hides
+             other apps from this app's package-visibility queries. -->
+        <intent>
+            <action android:name="android.intent.action.VIEW"/>
+            <data android:scheme="https"/>
+        </intent>
     </queries>
 </manifest>
