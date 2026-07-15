@@ -3,7 +3,7 @@ import 'dart:convert'; // For turning our data into text so it can be saved
 import 'package:app_settings/app_settings.dart'; // Opens the phone's Settings screens
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart'; // For local storage
-import 'due_status_storage.dart'; // Tracks "taken today" / "snoozed" per medication
+import 'due_status_storage.dart'; // Tracks "taken today" / "snoozed" per dose
 import 'notification_service.dart'; // Schedules the medication reminders
 import 'welcome_screen.dart'; // First-launch welcome / disclaimer screen
 
@@ -28,30 +28,92 @@ void main() async {
   runApp(const MedTrackerApp());
 }
 
+// ─── Small Shared Helpers ──────────────────────────────────────────────────
+
+/// Turns a 24-hour hour/minute pair into a friendly string like "8:30 AM".
+/// Used everywhere we display a dose time, so every screen formats times
+/// exactly the same way.
+String formatHourMinute(int hour, int minute) {
+  final hourOfPeriod = hour % 12 == 0 ? 12 : hour % 12;
+  final minuteStr = minute.toString().padLeft(2, '0');
+  final period = hour >= 12 ? 'PM' : 'AM';
+  return '$hourOfPeriod:$minuteStr $period';
+}
+
+/// Plain-language label for a dose count, e.g. 2 -> "Twice a day". Avoids
+/// medical shorthand like "BID"/"TID" so it stays clear for older adults.
+String timesPerDayLabel(int count) {
+  switch (count) {
+    case 1:
+      return 'Once a day';
+    case 2:
+      return 'Twice a day';
+    case 3:
+      return '3 times a day';
+    case 4:
+      return '4 times a day';
+    case 5:
+      return '5 times a day';
+    default:
+      return '$count times a day';
+  }
+}
+
+/// A fresh, never-before-used medication id. It's always an exact multiple
+/// of `NotificationService.medicationIdSpace`, which guarantees that the
+/// notification ids derived from it for each of its doses (see the
+/// "Notification id bands" comment in notification_service.dart) can never
+/// collide with another medication's doses.
+int generateMedicationId() {
+  final slot = DateTime.now().millisecondsSinceEpoch.remainder(
+    NotificationService.idSpace ~/ NotificationService.medicationIdSpace,
+  );
+  return slot * NotificationService.medicationIdSpace;
+}
+
 // ─── Data Model ────────────────────────────────────────────────────────────
+
+/// One time of day a medication should be taken. A medication now has a
+/// LIST of these instead of a single time, so it can support multiple doses
+/// a day, each tracked independently.
+class DoseTime {
+  final int hour; // 24-hour hour (0-23)
+  final int minute; // 0-59
+
+  const DoseTime({required this.hour, required this.minute});
+
+  /// Friendly display string, e.g. "8:30 AM".
+  String get label => formatHourMinute(hour, minute);
+
+  Map<String, dynamic> toJson() => {'hour': hour, 'minute': minute};
+
+  factory DoseTime.fromJson(Map<String, dynamic> json) =>
+      DoseTime(hour: json['hour'] as int, minute: json['minute'] as int);
+}
 
 /// Represents one medication the user wants to track.
 class Medication {
-  final int id; // Also used as the notification id for this medication.
+  final int id; // Also used to derive this medication's notification ids.
   final String name;
   final String dosage;
-  final String time; // Displayed as "8:30 AM"
-  final int hour; // 24-hour hour (0-23), used to schedule the reminder.
-  final int minute; // 0-59, used to schedule the reminder.
+
+  // Every time of day this medication should be taken, e.g. [8:00 AM,
+  // 2:00 PM, 8:00 PM] for "3 times a day". Each entry is tracked as a
+  // completely separate dose — see due_status_storage.dart.
+  final List<DoseTime> doseTimes;
 
   // How many minutes we keep sending "please confirm" repeat reminders
-  // after the dose becomes due, if the user hasn't tapped "I've taken it"
+  // after a dose becomes due, if the user hasn't tapped "I've taken it"
   // (or snoozed) yet. Chosen by the user when adding/editing the
   // medication — see the reminder-window selector in AddMedicationScreen.
+  // Applies to every dose of this medication.
   final int reminderWindowMinutes;
 
   Medication({
     required this.id,
     required this.name,
     required this.dosage,
-    required this.time,
-    required this.hour,
-    required this.minute,
+    required this.doseTimes,
     this.reminderWindowMinutes = 30,
   });
 
@@ -60,33 +122,41 @@ class Medication {
     'id': id,
     'name': name,
     'dosage': dosage,
-    'time': time,
-    'hour': hour,
-    'minute': minute,
+    'doseTimes': doseTimes.map((d) => d.toJson()).toList(),
     'reminderWindowMinutes': reminderWindowMinutes,
   };
 
   /// Recreate a Medication from a Map that was loaded out of storage.
-  factory Medication.fromJson(Map<String, dynamic> json) => Medication(
-    // Older saved medications (from before reminders were added) won't
-    // have an id/hour/minute yet, so fall back to sensible defaults
-    // rather than crashing. New ids are kept under `NotificationService
-    // .idSpace` so the daily/snooze/repeat notification id "bands"
-    // derived from them (see notification_service.dart) never collide.
-    id:
-        json['id'] as int? ??
-        DateTime.now().millisecondsSinceEpoch.remainder(
-          NotificationService.idSpace,
-        ),
-    name: json['name'] as String,
-    dosage: json['dosage'] as String,
-    time: json['time'] as String,
-    hour: json['hour'] as int? ?? 8,
-    minute: json['minute'] as int? ?? 0,
-    // Older saved medications (from before repeat reminders existed)
-    // won't have this field yet, so default to 30 minutes.
-    reminderWindowMinutes: json['reminderWindowMinutes'] as int? ?? 30,
-  );
+  factory Medication.fromJson(Map<String, dynamic> json) {
+    final rawDoseTimes = json['doseTimes'] as List?;
+    final doseTimes = rawDoseTimes != null
+        ? rawDoseTimes
+              .map((d) => DoseTime.fromJson(d as Map<String, dynamic>))
+              .toList()
+        : [
+            // Medications saved before multi-dose support only ever had a
+            // single hour/minute pair. Migrate that into a one-item dose
+            // list so they keep loading — and reminding — exactly as
+            // before, just now represented the same way as every other
+            // medication.
+            DoseTime(
+              hour: json['hour'] as int? ?? 8,
+              minute: json['minute'] as int? ?? 0,
+            ),
+          ];
+    return Medication(
+      // Older saved medications (from before reminders were added) won't
+      // have an id yet, so fall back to a freshly generated one rather
+      // than crashing.
+      id: json['id'] as int? ?? generateMedicationId(),
+      name: json['name'] as String,
+      dosage: json['dosage'] as String,
+      doseTimes: doseTimes,
+      // Older saved medications (from before repeat reminders existed)
+      // won't have this field yet, so default to 30 minutes.
+      reminderWindowMinutes: json['reminderWindowMinutes'] as int? ?? 30,
+    );
+  }
 }
 
 // ─── Storage Helper ────────────────────────────────────────────────────────
@@ -205,6 +275,21 @@ class _AppEntryPointState extends State<AppEntryPoint> {
   }
 }
 
+// ─── Due Dose ──────────────────────────────────────────────────────────────
+
+/// Identifies one specific dose of one specific medication that is
+/// currently due — e.g. "the 2 PM dose of Lisinopril". Used to build the
+/// due-medication cards and to route "I've taken it" / "Remind me" taps
+/// back to the correct dose (and only that dose).
+class _DueDose {
+  final Medication medication;
+  final int doseIndex;
+
+  const _DueDose({required this.medication, required this.doseIndex});
+
+  DoseTime get doseTime => medication.doseTimes[doseIndex];
+}
+
 // ─── Home Screen ───────────────────────────────────────────────────────────
 
 /// The main screen showing the list of medications.
@@ -222,11 +307,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _isLoading = true; // True while we are reading from storage
 
   // ── "Due" tracking ──
-  // For every medication, `_dueStatus` holds whether/when it was taken or
-  // snoozed today. `_dueMedications` is the subset of `_medications` that
-  // are currently due, recomputed whenever anything relevant changes.
-  Map<int, DueStatusEntry> _dueStatus = {};
-  List<Medication> _dueMedications = [];
+  // For every DOSE (medicationId, doseIndex), `_dueStatus` holds whether/
+  // when it was taken or snoozed today. `_dueDoses` is the subset of doses,
+  // across all medications, that are currently due — recomputed whenever
+  // anything relevant changes.
+  Map<DoseKey, DueStatusEntry> _dueStatus = {};
+  List<_DueDose> _dueDoses = [];
 
   // ── Permission banner ──
   // Both default to `true` (assume granted) until we've actually checked,
@@ -234,9 +320,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _notificationsEnabled = true;
   bool _exactAlarmsEnabled = true;
 
-  // Re-checks which medications are due every 30 seconds, so a medication
-  // becomes due (and its card appears) without the user needing to
-  // manually refresh or reopen the app right at the scheduled time.
+  // Re-checks which doses are due every 30 seconds, so a dose becoming due
+  // (and its card appearing) doesn't require the user to manually refresh
+  // or reopen the app right at the scheduled time.
   Timer? _dueCheckTimer;
 
   @override
@@ -283,9 +369,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await _rescheduleAllReminderChains();
   }
 
-  /// (Re)schedules the "please confirm" repeat chain for every medication.
-  /// Safe to call as often as we like — see `_scheduleReminderChain` for
-  /// why this never creates duplicate or stacked-up notifications.
+  /// (Re)schedules the "please confirm" repeat chain for every dose of
+  /// every medication. Safe to call as often as we like — see
+  /// `_scheduleReminderChainForDose` for why this never creates duplicate
+  /// or stacked-up notifications.
   ///
   /// We call this whenever the app starts or comes back to the foreground,
   /// because that's the only time our Dart code actually runs to figure out
@@ -294,16 +381,24 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   /// closed (that's the whole point of exact-alarm scheduling), but nothing
   /// re-plans *tomorrow's* chain until the app is opened again. In
   /// practice, opening the app once a day (e.g. to check the medication
-  /// list) is enough to keep every future day's chain freshly scheduled.
+  /// list) is enough to keep every future day's chains freshly scheduled.
   Future<void> _rescheduleAllReminderChains() async {
     for (final medication in _medications) {
       await _scheduleReminderChain(medication);
     }
   }
 
+  /// Schedules the repeat-until-confirmed chain for every dose of a single
+  /// [medication], one dose at a time.
+  Future<void> _scheduleReminderChain(Medication medication) async {
+    for (var doseIndex = 0; doseIndex < medication.doseTimes.length; doseIndex++) {
+      await _scheduleReminderChainForDose(medication, doseIndex);
+    }
+  }
+
   /// Schedules (or re-schedules) the repeat-until-confirmed chain for a
-  /// single [medication], anchored to whichever occurrence of its daily
-  /// reminder is "next":
+  /// single dose ([doseIndex] of [medication]), anchored to whichever
+  /// occurrence of that dose's daily reminder is "next":
   ///   - If it hasn't been taken yet today, the chain is anchored to
   ///     *today's* scheduled time — this covers both "not due yet" (the
   ///     chain is scheduled ahead of time, ready to go) and "currently due,
@@ -311,12 +406,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   ///     just re-confirms what should already be pending).
   ///   - If it has already been taken today, the chain is anchored to
   ///     *tomorrow's* scheduled time instead, ready for the next day.
-  ///   - If the user is currently within an active snooze, we don't touch
-  ///     the chain at all — it was already cancelled when they snoozed (see
-  ///     `_snooze`), and there's nothing useful to schedule until the
-  ///     snooze itself fires or the day rolls over.
-  Future<void> _scheduleReminderChain(Medication medication) async {
-    final status = _dueStatus[medication.id];
+  ///   - If the user is currently within an active snooze for this dose, we
+  ///     don't touch its chain at all — it was already cancelled when they
+  ///     snoozed (see `_snooze`), and there's nothing useful to schedule
+  ///     until the snooze itself fires or the day rolls over.
+  Future<void> _scheduleReminderChainForDose(
+    Medication medication,
+    int doseIndex,
+  ) async {
+    final status = _dueStatus[(medication.id, doseIndex)];
     final now = DateTime.now();
 
     final snoozeUntilMillis = status?.snoozeUntilMillis;
@@ -327,12 +425,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (now.isBefore(snoozeUntil)) return; // Currently snoozed — skip.
     }
 
+    final doseTime = medication.doseTimes[doseIndex];
     var anchor = DateTime(
       now.year,
       now.month,
       now.day,
-      medication.hour,
-      medication.minute,
+      doseTime.hour,
+      doseTime.minute,
     );
     final takenToday = status?.takenDate == DueStatusStorage.todayString(now);
     if (takenToday) {
@@ -340,7 +439,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
 
     await NotificationService.instance.scheduleRepeatReminders(
-      medicationId: medication.id,
+      id: NotificationService.doseNotificationBaseId(medication.id, doseIndex),
       medicationName: medication.name,
       dosage: medication.dosage,
       anchorTime: anchor,
@@ -362,48 +461,70 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     });
   }
 
-  /// Re-checks, for every medication, whether it counts as "due" right now
-  /// (see `isMedicationDue` in due_status_storage.dart for the exact rule),
-  /// and updates `_dueMedications` so the due cards on screen stay current.
+  /// Re-checks, for every dose of every medication, whether it counts as
+  /// "due" right now (see `isMedicationDue` in due_status_storage.dart for
+  /// the exact rule), and updates `_dueDoses` so the due cards on screen
+  /// stay current. Each dose is checked completely independently — taking
+  /// the 8 AM dose never affects whether the 2 PM dose shows as due.
   void _recomputeDue() {
     if (!mounted) return;
     final now = DateTime.now();
-    final due = _medications
-        .where(
-          (m) => isMedicationDue(
-            hour: m.hour,
-            minute: m.minute,
-            status: _dueStatus[m.id],
-            now: now,
-          ),
-        )
-        .toList();
-    setState(() => _dueMedications = due);
+    final due = <_DueDose>[];
+    for (final medication in _medications) {
+      for (
+        var doseIndex = 0;
+        doseIndex < medication.doseTimes.length;
+        doseIndex++
+      ) {
+        final doseTime = medication.doseTimes[doseIndex];
+        final isDue = isMedicationDue(
+          hour: doseTime.hour,
+          minute: doseTime.minute,
+          status: _dueStatus[(medication.id, doseIndex)],
+          now: now,
+        );
+        if (isDue) {
+          due.add(_DueDose(medication: medication, doseIndex: doseIndex));
+        }
+      }
+    }
+    setState(() => _dueDoses = due);
   }
 
-  /// "I've taken it" — marks the dose as done for today, cancels any
-  /// pending snooze reminder AND the whole repeat-until-confirmed chain for
-  /// it (so it stops pinging every 5 minutes), and removes its due card.
-  Future<void> _markTaken(Medication medication) async {
-    await DueStatusStorage.markTakenToday(medication.id);
-    await NotificationService.instance.cancel(
-      NotificationService.snoozeNotificationId(medication.id),
+  /// "I've taken it" for one dose — marks just that dose as done for today,
+  /// cancels its pending snooze reminder AND its whole repeat-until-
+  /// confirmed chain (so it stops pinging every 5 minutes), and removes its
+  /// due card. Every other dose (of this medication or any other) is
+  /// completely unaffected.
+  Future<void> _markTaken(Medication medication, int doseIndex) async {
+    await DueStatusStorage.markTakenToday(medication.id, doseIndex);
+    final doseId = NotificationService.doseNotificationBaseId(
+      medication.id,
+      doseIndex,
     );
-    await NotificationService.instance.cancelRepeatReminders(medication.id);
+    await NotificationService.instance.cancel(
+      NotificationService.snoozeNotificationId(doseId),
+    );
+    await NotificationService.instance.cancelRepeatReminders(doseId);
     _dueStatus = await DueStatusStorage.loadAll();
     _recomputeDue();
   }
 
-  /// "Remind me in 10 minutes" — hides the due card for now, cancels the
-  /// repeat-until-confirmed chain (snoozing counts as "dealt with" for now,
-  /// so the every-5-minutes pings should stop), and schedules a one-time
-  /// reminder notification 10 minutes from now.
-  Future<void> _snooze(Medication medication) async {
+  /// "Remind me in 10 minutes" for one dose — hides that dose's due card
+  /// for now, cancels its repeat-until-confirmed chain (snoozing counts as
+  /// "dealt with" for now, so the every-5-minutes pings for this dose
+  /// should stop), and schedules a one-time reminder notification 10
+  /// minutes from now, just for this dose.
+  Future<void> _snooze(Medication medication, int doseIndex) async {
     final snoozeUntil = DateTime.now().add(const Duration(minutes: 10));
-    await DueStatusStorage.snooze(medication.id, snoozeUntil);
-    await NotificationService.instance.cancelRepeatReminders(medication.id);
+    await DueStatusStorage.snooze(medication.id, doseIndex, snoozeUntil);
+    final doseId = NotificationService.doseNotificationBaseId(
+      medication.id,
+      doseIndex,
+    );
+    await NotificationService.instance.cancelRepeatReminders(doseId);
     await NotificationService.instance.scheduleOneOffReminder(
-      id: NotificationService.snoozeNotificationId(medication.id),
+      id: NotificationService.snoozeNotificationId(doseId),
       medicationName: medication.name,
       dosage: medication.dosage,
       fireAt: snoozeUntil,
@@ -426,15 +547,25 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       setState(() => _medications = updated);
       await MedicationStorage.save(updated); // Persist to device storage
 
-      // Schedule a daily reminder that fires at this medication's time,
-      // plus its repeat-until-confirmed chain for the next time it's due.
-      await NotificationService.instance.scheduleDailyMedicationReminder(
-        id: newMed.id,
-        medicationName: newMed.name,
-        dosage: newMed.dosage,
-        hour: newMed.hour,
-        minute: newMed.minute,
-      );
+      // Schedule a daily reminder for EVERY dose time, plus each dose's own
+      // repeat-until-confirmed chain for the next time it's due.
+      for (
+        var doseIndex = 0;
+        doseIndex < newMed.doseTimes.length;
+        doseIndex++
+      ) {
+        final doseTime = newMed.doseTimes[doseIndex];
+        await NotificationService.instance.scheduleDailyMedicationReminder(
+          id: NotificationService.doseNotificationBaseId(
+            newMed.id,
+            doseIndex,
+          ),
+          medicationName: newMed.name,
+          dosage: newMed.dosage,
+          hour: doseTime.hour,
+          minute: doseTime.minute,
+        );
+      }
       await _scheduleReminderChain(newMed);
       _recomputeDue();
     }
@@ -457,35 +588,51 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     setState(() => _medications = updated);
     await MedicationStorage.save(updated);
 
-    // The time or reminder window may have changed, so cancel the old
-    // repeat chain and re-schedule everything from scratch. The daily and
-    // snooze ids stay the same (same medication id), so re-scheduling the
-    // daily reminder simply overwrites the old one.
-    await NotificationService.instance.cancelRepeatReminders(updatedMed.id);
-    await NotificationService.instance.scheduleDailyMedicationReminder(
-      id: updatedMed.id,
-      medicationName: updatedMed.name,
-      dosage: updatedMed.dosage,
-      hour: updatedMed.hour,
-      minute: updatedMed.minute,
-    );
+    // The number of doses and/or their times may have changed, so cancel
+    // absolutely everything that could be scheduled for this medication's
+    // OLD doses (daily reminders, snoozes, repeat chains — for every
+    // possible dose slot, not just the ones it used to have), and clear its
+    // taken/snoozed tracking too: a stored "dose 1 was taken today" entry
+    // would otherwise keep pointing at dose index 1, even if that index now
+    // means a completely different time of day. Then reschedule everything
+    // fresh from the new dose list.
+    await NotificationService.instance.cancelAllForMedication(updatedMed.id);
+    await DueStatusStorage.clearForMedication(updatedMed.id);
+    _dueStatus = await DueStatusStorage.loadAll();
+
+    for (
+      var doseIndex = 0;
+      doseIndex < updatedMed.doseTimes.length;
+      doseIndex++
+    ) {
+      final doseTime = updatedMed.doseTimes[doseIndex];
+      await NotificationService.instance.scheduleDailyMedicationReminder(
+        id: NotificationService.doseNotificationBaseId(
+          updatedMed.id,
+          doseIndex,
+        ),
+        medicationName: updatedMed.name,
+        dosage: updatedMed.dosage,
+        hour: doseTime.hour,
+        minute: doseTime.minute,
+      );
+    }
     await _scheduleReminderChain(updatedMed);
     _recomputeDue();
   }
 
   /// Remove the medication at [index] from the list, save, and stop all of
-  /// its reminder notifications (daily, any pending snooze, and the whole
-  /// repeat-until-confirmed chain).
+  /// its reminder notifications (every dose's daily reminder, any pending
+  /// snooze, and every dose's repeat-until-confirmed chain), and forget its
+  /// taken/snoozed history.
   Future<void> _deleteMedication(int index) async {
     final removed = _medications[index];
     final updated = [..._medications]..removeAt(index);
     setState(() => _medications = updated);
     await MedicationStorage.save(updated);
-    await NotificationService.instance.cancel(removed.id);
-    await NotificationService.instance.cancel(
-      NotificationService.snoozeNotificationId(removed.id),
-    );
-    await NotificationService.instance.cancelRepeatReminders(removed.id);
+    await NotificationService.instance.cancelAllForMedication(removed.id);
+    await DueStatusStorage.clearForMedication(removed.id);
+    _dueStatus = await DueStatusStorage.loadAll();
     _recomputeDue();
   }
 
@@ -519,15 +666,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ],
       ),
       // Show a spinner while loading. Once loaded, stack (top to bottom):
-      // the permission warning banner (if needed), any due-medication
-      // cards, then the full medication list below.
+      // the permission warning banner (if needed), any due-dose cards, then
+      // the full medication list below.
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
           : Column(
               children: [
                 if (!_notificationsEnabled || !_exactAlarmsEnabled)
                   _buildPermissionBanner(),
-                if (_dueMedications.isNotEmpty) _buildDueSection(),
+                if (_dueDoses.isNotEmpty) _buildDueSection(),
                 Expanded(
                   child: _medications.isEmpty
                       ? _buildEmptyState()
@@ -620,15 +767,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
-  /// The stack of "due now" cards, one per medication that is currently due.
+  /// The stack of "due now" cards, one per DOSE that is currently due (a
+  /// medication with two due doses at once would show two separate cards).
   Widget _buildDueSection() {
     return Column(
-      children: _dueMedications
+      children: _dueDoses
           .map(
-            (medication) => _DueMedicationCard(
-              medication: medication,
-              onTaken: () => _markTaken(medication),
-              onSnooze: () => _snooze(medication),
+            (dueDose) => _DueMedicationCard(
+              medication: dueDose.medication,
+              doseTime: dueDose.doseTime,
+              onTaken: () => _markTaken(dueDose.medication, dueDose.doseIndex),
+              onSnooze: () => _snooze(dueDose.medication, dueDose.doseIndex),
             ),
           )
           .toList(),
@@ -694,9 +843,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
 // ─── Medication Card ───────────────────────────────────────────────────────
 
-/// A single card in the medication list showing name, dosage, and time.
-/// Tapping anywhere on the card (other than the delete button) opens it for
-/// editing, including its reminder window.
+/// A single card in the medication list showing name, dosage, and every
+/// dose time. Tapping anywhere on the card (other than the delete button)
+/// opens it for editing, including its dose times and reminder window.
 class _MedicationCard extends StatelessWidget {
   const _MedicationCard({
     required this.medication,
@@ -719,6 +868,7 @@ class _MedicationCard extends StatelessWidget {
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 18),
           child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               // Blue icon badge on the left
               Container(
@@ -754,23 +904,43 @@ class _MedicationCard extends StatelessWidget {
                         color: Colors.black87,
                       ),
                     ),
-                    const SizedBox(height: 6),
-                    Row(
-                      children: [
-                        const Icon(
-                          Icons.access_time,
-                          size: 18,
-                          color: Colors.black54,
-                        ),
-                        const SizedBox(width: 4),
-                        Text(
-                          medication.time,
-                          style: const TextStyle(
-                            fontSize: 18,
-                            color: Colors.black54,
-                          ),
-                        ),
-                      ],
+                    const SizedBox(height: 8),
+                    Text(
+                      timesPerDayLabel(medication.doseTimes.length),
+                      style: const TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w600,
+                        color: Color(0xFF1A4B8C),
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    // Every dose time, wrapping onto a new line if there
+                    // isn't room for them all on one.
+                    Wrap(
+                      spacing: 14,
+                      runSpacing: 4,
+                      children: medication.doseTimes
+                          .map(
+                            (doseTime) => Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const Icon(
+                                  Icons.access_time,
+                                  size: 18,
+                                  color: Colors.black54,
+                                ),
+                                const SizedBox(width: 4),
+                                Text(
+                                  doseTime.label,
+                                  style: const TextStyle(
+                                    fontSize: 18,
+                                    color: Colors.black54,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          )
+                          .toList(),
                     ),
                     const SizedBox(height: 4),
                     Text(
@@ -806,18 +976,22 @@ class _MedicationCard extends StatelessWidget {
 
 // ─── Due Medication Card ───────────────────────────────────────────────────
 
-/// The prominent card shown at the top of the home screen when a medication
-/// is due: its scheduled time has arrived and it hasn't been taken (or
+/// The prominent card shown at the top of the home screen when a specific
+/// DOSE is due: its scheduled time has arrived and it hasn't been taken (or
 /// snoozed) yet today. Uses a bold amber/orange colour so it stands out
-/// clearly from the ordinary medication list below.
+/// clearly from the ordinary medication list below. A medication with
+/// multiple doses due at once (rare, but possible if the app was closed for
+/// a while) shows one of these cards per due dose.
 class _DueMedicationCard extends StatelessWidget {
   const _DueMedicationCard({
     required this.medication,
+    required this.doseTime,
     required this.onTaken,
     required this.onSnooze,
   });
 
   final Medication medication;
+  final DoseTime doseTime;
   final VoidCallback onTaken;
   final VoidCallback onSnooze;
 
@@ -866,6 +1040,22 @@ class _DueMedicationCard extends StatelessWidget {
             Text(
               medication.dosage,
               style: const TextStyle(fontSize: 20, color: Colors.black87),
+            ),
+            const SizedBox(height: 10),
+
+            // Which dose time this card is for — important once a
+            // medication has more than one dose a day.
+            Row(
+              children: [
+                const Icon(Icons.access_time, size: 20, color: Colors.black54),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    'Scheduled for ${doseTime.label}',
+                    style: const TextStyle(fontSize: 18, color: Colors.black87),
+                  ),
+                ),
+              ],
             ),
             const SizedBox(height: 16),
 
@@ -958,15 +1148,36 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
   final _nameController = TextEditingController();
   final _dosageController = TextEditingController();
 
-  // Null until the user picks a time from the time picker.
-  TimeOfDay? _selectedTime;
+  // How many times a day this medication is taken (1-5). Drives how many
+  // dose-time rows are shown below.
+  int _timesPerDay = 1;
+
+  // Only meaningful when _timesPerDay > 1: whether the user is setting
+  // times via "Even Intervals" (pick a start time + hours between doses,
+  // and let the app do the math) or "Custom Times" (pick every dose time
+  // by hand). Both modes end up filling the same `_doseTimes` list below,
+  // which is what's actually shown, individually tappable, and saved.
+  bool _useEvenIntervals = true;
+
+  // Even-interval inputs.
+  TimeOfDay? _intervalStartTime;
+  int _intervalHours = 8;
+
+  // The actual dose times — always exactly `_timesPerDay` entries long.
+  // Null means "not picked yet" (only possible in Custom Times mode,
+  // before the user has tapped that row).
+  List<TimeOfDay?> _doseTimes = [null];
 
   // How many minutes to keep sending "please confirm" repeat reminders if
-  // the dose isn't confirmed. 30 minutes is a reasonable default.
+  // a dose isn't confirmed. 30 minutes is a reasonable default. Applies to
+  // every dose of this medication.
   int _selectedWindowMinutes = 30;
 
   // The reminder-window choices offered to the user, in minutes.
   static const _windowOptions = [15, 30, 60];
+
+  // The "how many times a day" choices offered to the user.
+  static const _timesPerDayOptions = [1, 2, 3, 4, 5];
 
   bool get _isEditing => widget.existing != null;
 
@@ -979,7 +1190,16 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
     if (existing != null) {
       _nameController.text = existing.name;
       _dosageController.text = existing.dosage;
-      _selectedTime = TimeOfDay(hour: existing.hour, minute: existing.minute);
+      _timesPerDay = existing.doseTimes.length.clamp(1, 5);
+      _doseTimes = existing.doseTimes
+          .map((d) => TimeOfDay(hour: d.hour, minute: d.minute))
+          .toList();
+      // We don't know whether this medication was originally set up with
+      // even intervals or fully custom times, so start in Custom Times
+      // mode with every saved time pre-filled exactly as-is. The user can
+      // still switch to "Even Intervals" afterward if they'd rather have
+      // the app recalculate them from a start time + interval.
+      _useEvenIntervals = false;
       _selectedWindowMinutes = existing.reminderWindowMinutes;
     }
   }
@@ -992,25 +1212,113 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
     super.dispose();
   }
 
-  /// Open the built-in system time picker dialog.
-  Future<void> _pickTime() async {
+  // ── "How many times a day" ─────────────────────────────────────────────
+
+  void _setTimesPerDay(int count) {
+    setState(() {
+      _timesPerDay = count;
+      if (_useEvenIntervals) {
+        _recalculateEvenIntervalTimes();
+      } else {
+        _resizeDoseTimesList(count);
+      }
+    });
+  }
+
+  /// Grows or shrinks `_doseTimes` to exactly [count] entries, keeping
+  /// whatever times were already picked (extra new slots start blank;
+  /// entries beyond the new count are simply dropped).
+  void _resizeDoseTimesList(int count) {
+    if (_doseTimes.length == count) return;
+    if (_doseTimes.length > count) {
+      _doseTimes = _doseTimes.sublist(0, count);
+    } else {
+      _doseTimes = [
+        ..._doseTimes,
+        for (var i = _doseTimes.length; i < count; i++) null,
+      ];
+    }
+  }
+
+  // ── Even Intervals / Custom Times mode ─────────────────────────────────
+
+  void _setUseEvenIntervals(bool useEvenIntervals) {
+    setState(() {
+      _useEvenIntervals = useEvenIntervals;
+      if (useEvenIntervals) {
+        _recalculateEvenIntervalTimes();
+      }
+    });
+  }
+
+  /// Fills `_doseTimes` from `_intervalStartTime` + `_intervalHours`,
+  /// spacing doses evenly, wrapping past midnight if needed — e.g. a start
+  /// time of 8:00 AM, every 6 hours, 4 times a day gives 8:00 AM, 2:00 PM,
+  /// 8:00 PM, 2:00 AM. Until a start time has been picked, this just
+  /// resizes the list (see `_resizeDoseTimesList`) without inventing times.
+  void _recalculateEvenIntervalTimes() {
+    final start = _intervalStartTime;
+    if (start == null) {
+      _resizeDoseTimesList(_timesPerDay);
+      return;
+    }
+    var totalMinutes = start.hour * 60 + start.minute;
+    final times = <TimeOfDay?>[];
+    for (var i = 0; i < _timesPerDay; i++) {
+      final m = totalMinutes % (24 * 60);
+      times.add(TimeOfDay(hour: m ~/ 60, minute: m % 60));
+      totalMinutes += _intervalHours * 60;
+    }
+    _doseTimes = times;
+  }
+
+  Future<void> _pickIntervalStartTime() async {
     final picked = await showTimePicker(
       context: context,
-      initialTime: _selectedTime ?? TimeOfDay.now(),
-      helpText: 'Select time to take medication',
-      builder: (context, child) {
-        // Make the time picker's own text a bit larger too.
-        return MediaQuery(
-          data: MediaQuery.of(
-            context,
-          ).copyWith(textScaler: const TextScaler.linear(1.2)),
-          child: child!,
-        );
-      },
+      initialTime: _intervalStartTime ?? TimeOfDay.now(),
+      helpText: 'Select the time of the first dose',
+      builder: _largeTextTimePickerBuilder,
     );
     if (picked != null) {
-      setState(() => _selectedTime = picked);
+      setState(() {
+        _intervalStartTime = picked;
+        _recalculateEvenIntervalTimes();
+      });
     }
+  }
+
+  void _setIntervalHours(int hours) {
+    setState(() {
+      _intervalHours = hours;
+      _recalculateEvenIntervalTimes();
+    });
+  }
+
+  // ── Individual dose time rows (used by both modes) ─────────────────────
+
+  Future<void> _pickDoseTime(int index) async {
+    final picked = await showTimePicker(
+      context: context,
+      initialTime: _doseTimes[index] ?? TimeOfDay.now(),
+      helpText: _timesPerDay == 1
+          ? 'Select time to take medication'
+          : 'Select time for dose ${index + 1}',
+      builder: _largeTextTimePickerBuilder,
+    );
+    if (picked != null) {
+      setState(() => _doseTimes[index] = picked);
+    }
+  }
+
+  /// Makes the system time picker's own text a bit larger too, matching the
+  /// rest of the app.
+  Widget _largeTextTimePickerBuilder(BuildContext context, Widget? child) {
+    return MediaQuery(
+      data: MediaQuery.of(
+        context,
+      ).copyWith(textScaler: const TextScaler.linear(1.2)),
+      child: child!,
+    );
   }
 
   /// One big tappable button for a single reminder-window choice (e.g.
@@ -1040,12 +1348,213 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
     );
   }
 
-  /// Convert a TimeOfDay to a human-friendly string like "8:30 AM".
-  String _formatTime(TimeOfDay time) {
-    final hour = time.hourOfPeriod == 0 ? 12 : time.hourOfPeriod;
-    final minute = time.minute.toString().padLeft(2, '0');
-    final period = time.period == DayPeriod.am ? 'AM' : 'PM';
-    return '$hour:$minute $period';
+  /// The row of "Once a day" ... "5 times a day" choice buttons.
+  Widget _buildTimesPerDaySelector() {
+    return Wrap(
+      spacing: 10,
+      runSpacing: 10,
+      children: _timesPerDayOptions.map((count) {
+        final selected = _timesPerDay == count;
+        return OutlinedButton(
+          onPressed: () => _setTimesPerDay(count),
+          style: OutlinedButton.styleFrom(
+            backgroundColor: selected ? const Color(0xFF1A4B8C) : Colors.white,
+            foregroundColor: selected ? Colors.white : const Color(0xFF1A4B8C),
+            side: const BorderSide(color: Color(0xFF1A4B8C), width: 2),
+            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 18),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(10),
+            ),
+          ),
+          child: Text(
+            timesPerDayLabel(count),
+            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          ),
+        );
+      }).toList(),
+    );
+  }
+
+  /// The "Even Intervals" / "Custom Times" toggle, shown only when there's
+  /// more than one dose a day (with a single dose, there's nothing to
+  /// choose between).
+  Widget _buildModeToggle() {
+    return Row(
+      children: [
+        Expanded(child: _modeButton('Even Intervals', true)),
+        const SizedBox(width: 10),
+        Expanded(child: _modeButton('Custom Times', false)),
+      ],
+    );
+  }
+
+  Widget _modeButton(String label, bool value) {
+    final selected = _useEvenIntervals == value;
+    return OutlinedButton(
+      onPressed: () => _setUseEvenIntervals(value),
+      style: OutlinedButton.styleFrom(
+        backgroundColor: selected ? const Color(0xFF1A4B8C) : Colors.white,
+        foregroundColor: selected ? Colors.white : const Color(0xFF1A4B8C),
+        side: const BorderSide(color: Color(0xFF1A4B8C), width: 2),
+        padding: const EdgeInsets.symmetric(vertical: 18),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      ),
+      child: Text(
+        label,
+        style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+      ),
+    );
+  }
+
+  /// The tappable box for picking the first dose's time, in Even Intervals
+  /// mode.
+  Widget _buildIntervalStartTimeField() {
+    return GestureDetector(
+      onTap: _pickIntervalStartTime,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
+        decoration: BoxDecoration(
+          border: Border.all(color: Colors.black54),
+          borderRadius: BorderRadius.circular(4),
+        ),
+        child: Row(
+          children: [
+            const Icon(Icons.access_time, size: 28, color: Colors.black54),
+            const SizedBox(width: 12),
+            // Expanded lets long placeholder text wrap onto a second line
+            // instead of overflowing off the right edge of the screen.
+            Expanded(
+              child: Text(
+                _intervalStartTime == null
+                    ? 'Tap to select the first dose time'
+                    : formatHourMinute(
+                        _intervalStartTime!.hour,
+                        _intervalStartTime!.minute,
+                      ),
+                style: TextStyle(
+                  fontSize: 20,
+                  color: _intervalStartTime == null
+                      ? Colors.black45
+                      : Colors.black87,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Big +/- stepper for "hours between doses", e.g. "Every 8 hours".
+  Widget _buildIntervalHoursStepper() {
+    return Row(
+      children: [
+        _stepperButton(
+          icon: Icons.remove,
+          onPressed: _intervalHours > 1
+              ? () => _setIntervalHours(_intervalHours - 1)
+              : null,
+        ),
+        Expanded(
+          child: Center(
+            child: Text(
+              'Every $_intervalHours hour${_intervalHours == 1 ? '' : 's'}',
+              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+              textAlign: TextAlign.center,
+            ),
+          ),
+        ),
+        _stepperButton(
+          icon: Icons.add,
+          onPressed: _intervalHours < 23
+              ? () => _setIntervalHours(_intervalHours + 1)
+              : null,
+        ),
+      ],
+    );
+  }
+
+  Widget _stepperButton({required IconData icon, required VoidCallback? onPressed}) {
+    return SizedBox(
+      width: 56,
+      height: 56,
+      child: OutlinedButton(
+        onPressed: onPressed,
+        style: OutlinedButton.styleFrom(
+          side: const BorderSide(color: Color(0xFF1A4B8C), width: 2),
+          shape: const CircleBorder(),
+          padding: EdgeInsets.zero,
+        ),
+        child: Icon(icon, size: 26, color: const Color(0xFF1A4B8C)),
+      ),
+    );
+  }
+
+  /// One tappable dose-time row. Labeled "Time to Take" for a once-a-day
+  /// medication (matching the original single-time form), or "Dose N Time"
+  /// once there's more than one.
+  Widget _buildDoseTimeRow(int index) {
+    final label = _timesPerDay == 1 ? 'Time to Take' : 'Dose ${index + 1} Time';
+    final time = _doseTimes[index];
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            label,
+            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+          ),
+          const SizedBox(height: 8),
+          GestureDetector(
+            onTap: () => _pickDoseTime(index),
+            child: Container(
+              padding: const EdgeInsets.symmetric(
+                horizontal: 16,
+                vertical: 20,
+              ),
+              decoration: BoxDecoration(
+                border: Border.all(color: Colors.black54),
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: Row(
+                children: [
+                  const Icon(
+                    Icons.access_time,
+                    size: 28,
+                    color: Colors.black54,
+                  ),
+                  const SizedBox(width: 12),
+                  // Expanded lets long placeholder text wrap onto a second
+                  // line instead of overflowing off the right edge of the
+                  // screen.
+                  Expanded(
+                    child: Text(
+                      time == null
+                          ? 'Tap to select a time'
+                          : formatHourMinute(time.hour, time.minute),
+                      style: TextStyle(
+                        fontSize: 20,
+                        color: time == null ? Colors.black45 : Colors.black87,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showValidationError(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message, style: const TextStyle(fontSize: 18)),
+        backgroundColor: Colors.red,
+      ),
+    );
   }
 
   /// Validate the form; if everything looks good, pop back to HomeScreen
@@ -1054,41 +1563,36 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
     // _formKey.currentState!.validate() checks each field's validator function.
     if (!_formKey.currentState!.validate()) return;
 
-    if (_selectedTime == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Please select a time.',
-            style: TextStyle(fontSize: 18),
-          ),
-          backgroundColor: Colors.red,
-        ),
+    if (_timesPerDay > 1 && _useEvenIntervals && _intervalStartTime == null) {
+      _showValidationError('Please select the time of the first dose.');
+      return;
+    }
+
+    if (_doseTimes.any((t) => t == null)) {
+      _showValidationError(
+        _timesPerDay == 1
+            ? 'Please select a time.'
+            : 'Please set a time for every dose.',
       );
       return;
     }
 
+    final doseTimes = _doseTimes
+        .map((t) => DoseTime(hour: t!.hour, minute: t.minute))
+        .toList();
+
     // Send the new (or edited) medication back to HomeScreen. When editing,
     // keep the original id so it keeps using the same notification ids
-    // (the daily reminder, snooze, and repeat chain all get overwritten in
-    // place rather than duplicated).
+    // (every dose's daily reminder, snooze, and repeat chain all get
+    // overwritten in place rather than duplicated — see `_editMedication`
+    // in HomeScreen for exactly how).
     Navigator.pop(
       context,
       Medication(
-        id:
-            widget.existing?.id ??
-            // Android notification ids must fit in a 32-bit int, and every
-            // other notification for this medication is derived from this
-            // id by adding multiples of `NotificationService.idSpace` (see
-            // that constant's comment) — so the id itself must stay well
-            // under that to leave room for all of them.
-            DateTime.now().millisecondsSinceEpoch.remainder(
-              NotificationService.idSpace,
-            ),
+        id: widget.existing?.id ?? generateMedicationId(),
         name: _nameController.text.trim(),
         dosage: _dosageController.text.trim(),
-        time: _formatTime(_selectedTime!),
-        hour: _selectedTime!.hour,
-        minute: _selectedTime!.minute,
+        doseTimes: doseTimes,
         reminderWindowMinutes: _selectedWindowMinutes,
       ),
     );
@@ -1159,49 +1663,52 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
               ),
               const SizedBox(height: 28),
 
-              // ── Time ─────────────────────────────────────────────────────
+              // ── How Many Times a Day ────────────────────────────────────
               const Text(
-                'Time to Take',
+                'How Many Times a Day?',
                 style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
               ),
               const SizedBox(height: 10),
-              // We use a GestureDetector + Container to make a tappable box
-              // that looks like a form field but opens the time picker.
-              GestureDetector(
-                onTap: _pickTime,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 20,
-                  ),
-                  decoration: BoxDecoration(
-                    border: Border.all(color: Colors.black54),
-                    borderRadius: BorderRadius.circular(4),
-                  ),
-                  child: Row(
-                    children: [
-                      const Icon(
-                        Icons.access_time,
-                        size: 28,
-                        color: Colors.black54,
-                      ),
-                      const SizedBox(width: 12),
-                      Text(
-                        _selectedTime == null
-                            ? 'Tap to select a time'
-                            : _formatTime(_selectedTime!),
-                        style: TextStyle(
-                          fontSize: 20,
-                          color: _selectedTime == null
-                              ? Colors.black45
-                              : Colors.black87,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
+              _buildTimesPerDaySelector(),
               const SizedBox(height: 28),
+
+              // ── Even Intervals vs Custom Times (only if >1 dose) ────────
+              if (_timesPerDay > 1) ...[
+                const Text(
+                  'How Would You Like to Set the Times?',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 10),
+                _buildModeToggle(),
+                const SizedBox(height: 24),
+              ],
+
+              if (_timesPerDay > 1 && _useEvenIntervals) ...[
+                const Text(
+                  'First Dose Time',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(height: 8),
+                _buildIntervalStartTimeField(),
+                const SizedBox(height: 20),
+                const Text(
+                  'Hours Between Doses',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(height: 8),
+                _buildIntervalHoursStepper(),
+                const SizedBox(height: 10),
+                const Text(
+                  'We calculated these times for you — tap any one below '
+                  'to fine-tune it.',
+                  style: TextStyle(fontSize: 15, color: Colors.black54),
+                ),
+                const SizedBox(height: 16),
+              ],
+
+              // ── One tappable row per dose time ──────────────────────────
+              for (var i = 0; i < _timesPerDay; i++) _buildDoseTimeRow(i),
+              const SizedBox(height: 14),
 
               // ── Reminder Window ─────────────────────────────────────────
               const Text(
