@@ -19,11 +19,12 @@ void main() async {
   // It makes sure Flutter is fully set up before we touch storage.
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Set up the notification plugin and ask for the permissions we need
-  // (showing notifications, and scheduling them at an exact time) before
-  // the user even opens the Add Medication screen.
-  await NotificationService.instance.init();
-  await NotificationService.instance.requestPermissions();
+  // Set up notifications before rendering. A notification plug-in failure
+  // must not prevent the user from opening and reading their schedule; the
+  // home-screen permission warning provides the recoverable state instead.
+  try {
+    await NotificationService.instance.init();
+  } catch (_) {}
 
   runApp(const MedTrackerApp());
 }
@@ -47,28 +48,43 @@ String timesPerDayLabel(int count) {
     case 1:
       return 'Once a day';
     case 2:
-      return 'Twice a day';
+      return 'BID · Twice a day';
     case 3:
-      return '3 times a day';
+      return 'TID · 3 times a day';
     case 4:
-      return '4 times a day';
-    case 5:
-      return '5 times a day';
+      return 'QID · 4 times a day';
     default:
       return '$count times a day';
   }
 }
 
-/// A fresh, never-before-used medication id. It's always an exact multiple
-/// of `NotificationService.medicationIdSpace`, which guarantees that the
-/// notification ids derived from it for each of its doses (see the
-/// "Notification id bands" comment in notification_service.dart) can never
-/// collide with another medication's doses.
-int generateMedicationId() {
-  final slot = DateTime.now().millisecondsSinceEpoch.remainder(
-    NotificationService.idSpace ~/ NotificationService.medicationIdSpace,
+/// Calculates a true 24-hour even schedule. BID is every 12 hours, TID every
+/// 8 hours, and QID every 6 hours. Results are sorted by clock time so the UI
+/// and due-state logic always agree on what "today" means.
+List<DoseTime> evenlySpacedDoseTimes(TimeOfDay start, int count) {
+  final intervalMinutes = (24 * 60) ~/ count;
+  final startMinutes = start.hour * 60 + start.minute;
+  final times = <DoseTime>[
+    for (var index = 0; index < count; index++)
+      DoseTime(
+        hour: ((startMinutes + intervalMinutes * index) % (24 * 60)) ~/ 60,
+        minute: (startMinutes + intervalMinutes * index) % 60,
+      ),
+  ];
+  times.sort(
+    (left, right) => (left.hour * 60 + left.minute).compareTo(
+      right.hour * 60 + right.minute,
+    ),
   );
-  return slot * NotificationService.medicationIdSpace;
+  return times;
+}
+
+bool hasDuplicateDoseTimes(Iterable<DoseTime> times) {
+  final unique = <int>{};
+  for (final time in times) {
+    if (!unique.add(time.hour * 60 + time.minute)) return true;
+  }
+  return false;
 }
 
 // ─── Data Model ────────────────────────────────────────────────────────────
@@ -145,10 +161,9 @@ class Medication {
             ),
           ];
     return Medication(
-      // Older saved medications (from before reminders were added) won't
-      // have an id yet, so fall back to a freshly generated one rather
-      // than crashing.
-      id: json['id'] as int? ?? generateMedicationId(),
+      // MedicationStorage assigns a stable, safe id while loading if an older
+      // record has no id (or has one outside the current notification range).
+      id: json['id'] as int? ?? 0,
       name: json['name'] as String,
       dosage: json['dosage'] as String,
       doseTimes: doseTimes,
@@ -167,25 +182,193 @@ class Medication {
 /// Because it can only store strings, we convert each Medication to a JSON
 /// string before saving, and parse it back when loading.
 class MedicationStorage {
-  // The key used to look up our list inside SharedPreferences.
   static const _storageKey = 'medications';
+  static const _nextIdSlotKey = 'next_medication_id_slot';
+  static const _pendingCleanupKey = 'pending_notification_cleanup_ids';
+  static const _pendingDoseCleanupKey = 'pending_dose_notification_cleanup_ids';
+
+  static bool _isSafeId(int id) =>
+      id > 0 &&
+      id < NotificationService.idSpace &&
+      id % NotificationService.medicationIdSpace == 0;
+
+  static Medication _withId(Medication medication, int id) => Medication(
+    id: id,
+    name: medication.name,
+    dosage: medication.dosage,
+    doseTimes: medication.doseTimes,
+    reminderWindowMinutes: medication.reminderWindowMinutes,
+  );
 
   /// Load all saved medications from the device.
   /// Returns an empty list if nothing has been saved yet.
   static Future<List<Medication>> load() async {
     final prefs = await SharedPreferences.getInstance();
-    // getStringList returns null if the key doesn't exist yet, so we use ?? []
     final jsonStrings = prefs.getStringList(_storageKey) ?? [];
-    return jsonStrings
+    final loaded = jsonStrings
         .map((s) => Medication.fromJson(jsonDecode(s) as Map<String, dynamic>))
         .toList();
+    final idCounts = <int, int>{};
+    for (final medication in loaded) {
+      idCounts.update(medication.id, (count) => count + 1, ifAbsent: () => 1);
+    }
+
+    final usedIds = {
+      for (final medication in loaded)
+        if (_isSafeId(medication.id)) medication.id,
+    };
+    final keptSafeIds = <int>{};
+    var nextSlot = 1;
+    int nextFreeId() {
+      while (usedIds.contains(
+        nextSlot * NotificationService.medicationIdSpace,
+      )) {
+        nextSlot++;
+      }
+      final id = nextSlot * NotificationService.medicationIdSpace;
+      nextSlot++;
+      return id;
+    }
+
+    final replacements = <int, int>{};
+    final oldIdsToCleanUp = <int>{};
+    var changed = false;
+    final normalized = <Medication>[];
+    for (final medication in loaded) {
+      if (_isSafeId(medication.id) && keptSafeIds.add(medication.id)) {
+        normalized.add(medication);
+        continue;
+      }
+
+      final newId = nextFreeId();
+      usedIds.add(newId);
+      normalized.add(_withId(medication, newId));
+      changed = true;
+      if (medication.id != 0) {
+        oldIdsToCleanUp.add(medication.id);
+        // A duplicated old id has ambiguous state, so do not copy it to one
+        // of the duplicates arbitrarily.
+        if (idCounts[medication.id] == 1) {
+          replacements[medication.id] = newId;
+        }
+      }
+    }
+
+    if (changed) {
+      await _addPendingCleanupIds(prefs, oldIdsToCleanUp);
+      await DueStatusStorage.remapMedicationIds(replacements);
+      await _saveWithPreferences(prefs, normalized);
+    }
+
+    final highestSlot = usedIds.isEmpty
+        ? 0
+        : usedIds.reduce((left, right) => left > right ? left : right) ~/
+              NotificationService.medicationIdSpace;
+    final storedNextSlot = prefs.getInt(_nextIdSlotKey) ?? 1;
+    if (storedNextSlot <= highestSlot) {
+      final saved = await prefs.setInt(_nextIdSlotKey, highestSlot + 1);
+      if (!saved) throw StateError('Medication id counter could not be saved.');
+    }
+    return normalized;
   }
 
   /// Save the full list of medications to the device, replacing the old list.
   static Future<void> save(List<Medication> medications) async {
     final prefs = await SharedPreferences.getInstance();
+    await _saveWithPreferences(prefs, medications);
+  }
+
+  static Future<void> _saveWithPreferences(
+    SharedPreferences prefs,
+    List<Medication> medications,
+  ) async {
     final jsonStrings = medications.map((m) => jsonEncode(m.toJson())).toList();
-    await prefs.setStringList(_storageKey, jsonStrings);
+    final saved = await prefs.setStringList(_storageKey, jsonStrings);
+    if (!saved) throw StateError('Medication schedule could not be saved.');
+  }
+
+  static Future<int> allocateId() async {
+    final prefs = await SharedPreferences.getInstance();
+    final slot = prefs.getInt(_nextIdSlotKey) ?? 1;
+    final maxSlot =
+        NotificationService.idSpace ~/ NotificationService.medicationIdSpace;
+    if (slot >= maxSlot) throw StateError('No medication ids are available.');
+    final saved = await prefs.setInt(_nextIdSlotKey, slot + 1);
+    if (!saved) throw StateError('Medication id counter could not be saved.');
+    return slot * NotificationService.medicationIdSpace;
+  }
+
+  static Future<void> _addPendingCleanupIds(
+    SharedPreferences prefs,
+    Iterable<int> ids,
+  ) async {
+    final pending = <String>{
+      ...prefs.getStringList(_pendingCleanupKey) ?? [],
+      ...ids.map((id) => '$id'),
+    };
+    final saved = await prefs.setStringList(
+      _pendingCleanupKey,
+      pending.toList(),
+    );
+    if (!saved) throw StateError('Reminder cleanup could not be queued.');
+  }
+
+  static Future<void> queueNotificationCleanup(int medicationId) async {
+    final prefs = await SharedPreferences.getInstance();
+    await _addPendingCleanupIds(prefs, [medicationId]);
+  }
+
+  static Future<List<int>> pendingNotificationCleanupIds() async {
+    final prefs = await SharedPreferences.getInstance();
+    return (prefs.getStringList(_pendingCleanupKey) ?? [])
+        .map(int.tryParse)
+        .whereType<int>()
+        .toList();
+  }
+
+  static Future<void> completeNotificationCleanup(int medicationId) async {
+    final prefs = await SharedPreferences.getInstance();
+    final pending = {...prefs.getStringList(_pendingCleanupKey) ?? []}
+      ..remove('$medicationId');
+    final saved = await prefs.setStringList(
+      _pendingCleanupKey,
+      pending.toList(),
+    );
+    if (!saved) throw StateError('Reminder cleanup status could not be saved.');
+  }
+
+  static Future<void> queueDoseNotificationCleanup(int doseId) async {
+    final prefs = await SharedPreferences.getInstance();
+    final pending = <String>{
+      ...prefs.getStringList(_pendingDoseCleanupKey) ?? [],
+      '$doseId',
+    };
+    final saved = await prefs.setStringList(
+      _pendingDoseCleanupKey,
+      pending.toList(),
+    );
+    if (!saved) throw StateError('Dose reminder cleanup could not be queued.');
+  }
+
+  static Future<List<int>> pendingDoseNotificationCleanupIds() async {
+    final prefs = await SharedPreferences.getInstance();
+    return (prefs.getStringList(_pendingDoseCleanupKey) ?? [])
+        .map(int.tryParse)
+        .whereType<int>()
+        .toList();
+  }
+
+  static Future<void> completeDoseNotificationCleanup(int doseId) async {
+    final prefs = await SharedPreferences.getInstance();
+    final pending = {...prefs.getStringList(_pendingDoseCleanupKey) ?? []}
+      ..remove('$doseId');
+    final saved = await prefs.setStringList(
+      _pendingDoseCleanupKey,
+      pending.toList(),
+    );
+    if (!saved) {
+      throw StateError('Dose reminder cleanup status could not be saved.');
+    }
   }
 }
 
@@ -198,7 +381,7 @@ class MedTrackerApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'My Medications',
+      title: 'MediGuard',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(
@@ -250,7 +433,7 @@ class _AppEntryPointState extends State<AppEntryPoint> {
   Future<void> _checkIfWelcomeWasSeen() async {
     final prefs = await SharedPreferences.getInstance();
     final seen = prefs.getBool(_welcomeSeenPrefsKey) ?? false;
-    setState(() => _hasSeenWelcome = seen);
+    if (mounted) setState(() => _hasSeenWelcome = seen);
   }
 
   /// Called when the user taps "I Understand — Get Started" on the welcome
@@ -259,7 +442,7 @@ class _AppEntryPointState extends State<AppEntryPoint> {
   Future<void> _completeWelcome() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_welcomeSeenPrefsKey, true);
-    setState(() => _hasSeenWelcome = true);
+    if (mounted) setState(() => _hasSeenWelcome = true);
   }
 
   @override
@@ -305,6 +488,8 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   List<Medication> _medications = [];
   bool _isLoading = true; // True while we are reading from storage
+  bool _actionInProgress = false;
+  String? _storageError;
 
   // ── "Due" tracking ──
   // For every DOSE (medicationId, doseIndex), `_dueStatus` holds whether/
@@ -331,7 +516,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     // Load saved medications as soon as the screen appears.
     _loadMedications();
-    _checkPermissions();
+    _requestPermissionsAndCheck();
     _dueCheckTimer = Timer.periodic(
       const Duration(seconds: 30),
       (_) => _recomputeDue(),
@@ -351,22 +536,57 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      _checkPermissions();
+      unawaited(_checkPermissions());
       _recomputeDue();
-      _rescheduleAllReminderChains();
+      unawaited(_refreshReminderChainsAfterResume());
+    }
+  }
+
+  Future<void> _refreshReminderChainsAfterResume() async {
+    try {
+      await _reconcileNotifications();
+    } catch (_) {
+      _showMessage('Some reminders could not be refreshed. Check permissions.');
     }
   }
 
   Future<void> _loadMedications() async {
-    final loaded = await MedicationStorage.load();
-    final dueStatus = await DueStatusStorage.loadAll();
-    setState(() {
-      _medications = loaded;
-      _dueStatus = dueStatus;
-      _isLoading = false;
-    });
-    _recomputeDue();
-    await _rescheduleAllReminderChains();
+    try {
+      final loaded = await MedicationStorage.load();
+      final dueStatus = await DueStatusStorage.loadAll();
+      if (!mounted) return;
+      setState(() {
+        _medications = loaded;
+        _dueStatus = dueStatus;
+        _storageError = null;
+        _isLoading = false;
+      });
+      _recomputeDue();
+      try {
+        await _reconcileNotifications();
+      } catch (_) {
+        _showMessage(
+          'Some reminders could not be refreshed. Check permissions.',
+        );
+      }
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _storageError =
+            'Saved medication data could not be read. Please retry before changing the schedule.';
+        _isLoading = false;
+      });
+    }
+  }
+
+  Future<void> _requestPermissionsAndCheck() async {
+    try {
+      await NotificationService.instance.init();
+      await NotificationService.instance.requestPermissions();
+    } catch (_) {
+      // The permission banner below is the recoverable UI for this failure.
+    }
+    await _checkPermissions();
   }
 
   /// (Re)schedules the "please confirm" repeat chain for every dose of
@@ -374,24 +594,67 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   /// `_scheduleReminderChainForDose` for why this never creates duplicate
   /// or stacked-up notifications.
   ///
-  /// We call this whenever the app starts or comes back to the foreground,
-  /// because that's the only time our Dart code actually runs to figure out
-  /// "what's the next dose, and how much of its repeat window is left?" —
-  /// the repeat notifications themselves keep firing while the app is
-  /// closed (that's the whole point of exact-alarm scheduling), but nothing
-  /// re-plans *tomorrow's* chain until the app is opened again. In
-  /// practice, opening the app once a day (e.g. to check the medication
-  /// list) is enough to keep every future day's chains freshly scheduled.
-  Future<void> _rescheduleAllReminderChains() async {
-    for (final medication in _medications) {
-      await _scheduleReminderChain(medication);
+  /// We call this whenever the app starts or returns to the foreground so the
+  /// next dose occurrence always has a fresh one-off follow-up series. Taken
+  /// and Snooze also schedule the following day's series directly.
+  Future<void> _reconcileNotifications() async {
+    await NotificationService.instance.init();
+    var hadError = false;
+    for (final doseId
+        in await MedicationStorage.pendingDoseNotificationCleanupIds()) {
+      try {
+        await NotificationService.instance.cancelAllForDose(doseId);
+        await MedicationStorage.completeDoseNotificationCleanup(doseId);
+      } catch (_) {
+        hadError = true;
+      }
     }
+    for (final oldId
+        in await MedicationStorage.pendingNotificationCleanupIds()) {
+      try {
+        await NotificationService.instance.cancelAllForMedication(oldId);
+        await MedicationStorage.completeNotificationCleanup(oldId);
+      } catch (_) {
+        hadError = true;
+      }
+    }
+    for (final medication in _medications) {
+      try {
+        await _scheduleDailyReminders(medication);
+        for (
+          var doseIndex = medication.doseTimes.length;
+          doseIndex < NotificationService.maxDosesPerMedication;
+          doseIndex++
+        ) {
+          await NotificationService.instance.cancelAllForDose(
+            NotificationService.doseNotificationBaseId(
+              medication.id,
+              doseIndex,
+            ),
+          );
+        }
+      } catch (_) {
+        hadError = true;
+      }
+    }
+    for (final medication in _medications) {
+      try {
+        await _scheduleReminderChain(medication);
+      } catch (_) {
+        hadError = true;
+      }
+    }
+    if (hadError) throw StateError('Some reminders could not be reconciled.');
   }
 
   /// Schedules the repeat-until-confirmed chain for every dose of a single
   /// [medication], one dose at a time.
   Future<void> _scheduleReminderChain(Medication medication) async {
-    for (var doseIndex = 0; doseIndex < medication.doseTimes.length; doseIndex++) {
+    for (
+      var doseIndex = 0;
+      doseIndex < medication.doseTimes.length;
+      doseIndex++
+    ) {
       await _scheduleReminderChainForDose(medication, doseIndex);
     }
   }
@@ -406,10 +669,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   ///     just re-confirms what should already be pending).
   ///   - If it has already been taken today, the chain is anchored to
   ///     *tomorrow's* scheduled time instead, ready for the next day.
-  ///   - If the user is currently within an active snooze for this dose, we
-  ///     don't touch its chain at all — it was already cancelled when they
-  ///     snoozed (see `_snooze`), and there's nothing useful to schedule
-  ///     until the snooze itself fires or the day rolls over.
+  ///   - If the user is currently within an active snooze for this dose, the
+  ///     normal series starts tomorrow while a separate one-off snooze series
+  ///     handles the current dose.
   Future<void> _scheduleReminderChainForDose(
     Medication medication,
     int doseIndex,
@@ -418,12 +680,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final now = DateTime.now();
 
     final snoozeUntilMillis = status?.snoozeUntilMillis;
-    if (snoozeUntilMillis != null) {
-      final snoozeUntil = DateTime.fromMillisecondsSinceEpoch(
-        snoozeUntilMillis,
-      );
-      if (now.isBefore(snoozeUntil)) return; // Currently snoozed — skip.
-    }
+    final snoozeSeriesActive =
+        snoozeUntilMillis != null &&
+        now.isBefore(
+          DateTime.fromMillisecondsSinceEpoch(
+            snoozeUntilMillis,
+          ).add(Duration(minutes: medication.reminderWindowMinutes)),
+        );
 
     final doseTime = medication.doseTimes[doseIndex];
     var anchor = DateTime(
@@ -434,8 +697,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       doseTime.minute,
     );
     final takenToday = status?.takenDate == DueStatusStorage.todayString(now);
-    if (takenToday) {
-      anchor = anchor.add(const Duration(days: 1));
+    if (takenToday || snoozeSeriesActive) {
+      anchor = DateTime(
+        now.year,
+        now.month,
+        now.day + 1,
+        doseTime.hour,
+        doseTime.minute,
+      );
     }
 
     await NotificationService.instance.scheduleRepeatReminders(
@@ -450,10 +719,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   /// Ask Android whether notifications / exact alarms are currently allowed,
   /// and show/hide the warning banner accordingly.
   Future<void> _checkPermissions() async {
-    final notificationsEnabled = await NotificationService.instance
-        .areNotificationsEnabled();
-    final exactAlarmsEnabled = await NotificationService.instance
-        .canScheduleExactAlarms();
+    bool notificationsEnabled;
+    bool exactAlarmsEnabled;
+    try {
+      notificationsEnabled = await NotificationService.instance
+          .areNotificationsEnabled();
+      exactAlarmsEnabled = await NotificationService.instance
+          .canScheduleExactAlarms();
+    } catch (_) {
+      notificationsEnabled = false;
+      exactAlarmsEnabled = false;
+    }
     if (!mounted) return;
     setState(() {
       _notificationsEnabled = notificationsEnabled;
@@ -497,17 +773,34 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   /// due card. Every other dose (of this medication or any other) is
   /// completely unaffected.
   Future<void> _markTaken(Medication medication, int doseIndex) async {
-    await DueStatusStorage.markTakenToday(medication.id, doseIndex);
+    if (_actionInProgress) return;
+    setState(() => _actionInProgress = true);
     final doseId = NotificationService.doseNotificationBaseId(
       medication.id,
       doseIndex,
     );
-    await NotificationService.instance.cancel(
-      NotificationService.snoozeNotificationId(doseId),
-    );
-    await NotificationService.instance.cancelRepeatReminders(doseId);
-    _dueStatus = await DueStatusStorage.loadAll();
-    _recomputeDue();
+    try {
+      await MedicationStorage.queueDoseNotificationCleanup(doseId);
+      await DueStatusStorage.markTakenToday(medication.id, doseIndex);
+      _dueStatus = await DueStatusStorage.loadAll();
+      _recomputeDue();
+      try {
+        await NotificationService.instance.cancelAllForDose(doseId);
+        await _scheduleDailyReminderForDose(medication, doseIndex);
+        // Recreate the one-off repeat series starting tomorrow. Cancelling
+        // today's repeats must never disable the following dose occurrence.
+        await _scheduleReminderChainForDose(medication, doseIndex);
+        await MedicationStorage.completeDoseNotificationCleanup(doseId);
+      } catch (_) {
+        _showMessage(
+          'Marked as taken, but some old reminders may still appear.',
+        );
+      }
+    } catch (_) {
+      _showMessage('Could not save that this dose was taken. Try again.');
+    } finally {
+      if (mounted) setState(() => _actionInProgress = false);
+    }
   }
 
   /// "Remind me in 10 minutes" for one dose — hides that dose's due card
@@ -516,59 +809,166 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   /// should stop), and schedules a one-time reminder notification 10
   /// minutes from now, just for this dose.
   Future<void> _snooze(Medication medication, int doseIndex) async {
+    if (_actionInProgress) return;
     final snoozeUntil = DateTime.now().add(const Duration(minutes: 10));
-    await DueStatusStorage.snooze(medication.id, doseIndex, snoozeUntil);
+    final doseTime = medication.doseTimes[doseIndex];
+    final now = DateTime.now();
+    var nextDose = DateTime(
+      now.year,
+      now.month,
+      now.day,
+      doseTime.hour,
+      doseTime.minute,
+    );
+    if (!nextDose.isAfter(now)) {
+      nextDose = DateTime(
+        now.year,
+        now.month,
+        now.day + 1,
+        doseTime.hour,
+        doseTime.minute,
+      );
+    }
+    final snoozeSeriesEnds = snoozeUntil.add(
+      Duration(minutes: medication.reminderWindowMinutes),
+    );
+    if (!snoozeSeriesEnds.isBefore(nextDose)) {
+      _showMessage(
+        'Snooze is too close to the next scheduled dose. Check the label before continuing.',
+      );
+      return;
+    }
+    setState(() => _actionInProgress = true);
     final doseId = NotificationService.doseNotificationBaseId(
       medication.id,
       doseIndex,
     );
-    await NotificationService.instance.cancelRepeatReminders(doseId);
-    await NotificationService.instance.scheduleOneOffReminder(
-      id: NotificationService.snoozeNotificationId(doseId),
-      medicationName: medication.name,
-      dosage: medication.dosage,
-      fireAt: snoozeUntil,
+    var statusSaved = false;
+    try {
+      // Free today's normal follow-up slots before adding the snooze series,
+      // which also leaves room under iOS's pending-notification limit.
+      await NotificationService.instance.cancelRepeatReminders(doseId);
+      await NotificationService.instance.scheduleOneOffReminder(
+        id: NotificationService.snoozeNotificationId(doseId),
+        medicationName: medication.name,
+        dosage: medication.dosage,
+        fireAt: snoozeUntil,
+      );
+      await NotificationService.instance.scheduleSnoozeRepeatReminders(
+        id: doseId,
+        medicationName: medication.name,
+        dosage: medication.dosage,
+        snoozeUntil: snoozeUntil,
+        reminderWindowMinutes: medication.reminderWindowMinutes,
+      );
+      try {
+        await DueStatusStorage.snooze(medication.id, doseIndex, snoozeUntil);
+        statusSaved = true;
+      } catch (_) {
+        await NotificationService.instance.cancel(
+          NotificationService.snoozeNotificationId(doseId),
+        );
+        await NotificationService.instance.cancelSnoozeRepeatReminders(doseId);
+        rethrow;
+      }
+      _dueStatus = await DueStatusStorage.loadAll();
+      _recomputeDue();
+      // Standard repeats resume tomorrow; snooze-specific repeats cover today.
+      await _scheduleReminderChainForDose(medication, doseIndex);
+    } catch (_) {
+      if (statusSaved) {
+        try {
+          _dueStatus = await DueStatusStorage.loadAll();
+          _recomputeDue();
+        } catch (_) {}
+        _showMessage('Snoozed, but some old reminders may still appear.');
+      } else {
+        try {
+          await NotificationService.instance.cancel(
+            NotificationService.snoozeNotificationId(doseId),
+          );
+          await NotificationService.instance.cancelSnoozeRepeatReminders(
+            doseId,
+          );
+        } catch (_) {}
+        try {
+          await _scheduleReminderChainForDose(medication, doseIndex);
+        } catch (_) {}
+        _showMessage('The snooze reminder could not be scheduled. Try again.');
+      }
+    } finally {
+      if (mounted) setState(() => _actionInProgress = false);
+    }
+  }
+
+  void _showMessage(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message, style: const TextStyle(fontSize: 18))),
     );
-    _dueStatus = await DueStatusStorage.loadAll();
-    _recomputeDue();
   }
 
   /// Navigate to the Add Medication screen and wait for the result.
   Future<void> _openAddForm() async {
+    int newMedicationId;
+    try {
+      newMedicationId = await MedicationStorage.allocateId();
+    } catch (_) {
+      _showMessage('A new medication could not be started. Please try again.');
+      return;
+    }
+    if (!mounted) return;
     // Navigator.push opens a new screen. When that screen calls Navigator.pop
     // with a Medication object, it is returned here as `newMed`.
     final newMed = await Navigator.push<Medication>(
       context,
-      MaterialPageRoute(builder: (_) => const AddMedicationScreen()),
+      MaterialPageRoute(
+        builder: (_) => AddMedicationScreen(newMedicationId: newMedicationId),
+      ),
     );
     // If the user tapped Save (not Cancel), add the new medication.
     if (newMed != null) {
       final updated = [..._medications, newMed];
-      setState(() => _medications = updated);
-      await MedicationStorage.save(updated); // Persist to device storage
-
-      // Schedule a daily reminder for EVERY dose time, plus each dose's own
-      // repeat-until-confirmed chain for the next time it's due.
-      for (
-        var doseIndex = 0;
-        doseIndex < newMed.doseTimes.length;
-        doseIndex++
-      ) {
-        final doseTime = newMed.doseTimes[doseIndex];
-        await NotificationService.instance.scheduleDailyMedicationReminder(
-          id: NotificationService.doseNotificationBaseId(
-            newMed.id,
-            doseIndex,
-          ),
-          medicationName: newMed.name,
-          dosage: newMed.dosage,
-          hour: doseTime.hour,
-          minute: doseTime.minute,
-        );
+      try {
+        await MedicationStorage.save(updated);
+        if (mounted) setState(() => _medications = updated);
+        try {
+          await _scheduleDailyReminders(newMed);
+          await _scheduleReminderChain(newMed);
+        } catch (_) {
+          _showMessage(
+            '${newMed.name} was saved, but some reminders could not be scheduled.',
+          );
+        }
+        _recomputeDue();
+      } catch (_) {
+        _showMessage('The medication could not be saved. Please try again.');
       }
-      await _scheduleReminderChain(newMed);
-      _recomputeDue();
     }
+  }
+
+  Future<void> _scheduleDailyReminders(Medication medication) async {
+    for (
+      var doseIndex = 0;
+      doseIndex < medication.doseTimes.length;
+      doseIndex++
+    ) {
+      await _scheduleDailyReminderForDose(medication, doseIndex);
+    }
+  }
+
+  Future<void> _scheduleDailyReminderForDose(
+    Medication medication,
+    int doseIndex,
+  ) async {
+    final doseTime = medication.doseTimes[doseIndex];
+    await NotificationService.instance.scheduleDailyMedicationReminder(
+      id: NotificationService.doseNotificationBaseId(medication.id, doseIndex),
+      medicationName: medication.name,
+      dosage: medication.dosage,
+      hour: doseTime.hour,
+      minute: doseTime.minute,
+    );
   }
 
   /// Navigate to the Add Medication screen pre-filled with [medication]'s
@@ -585,8 +985,25 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     final updated = [..._medications];
     updated[index] = updatedMed;
-    setState(() => _medications = updated);
-    await MedicationStorage.save(updated);
+    final scheduleChanged =
+        original.doseTimes.length != updatedMed.doseTimes.length ||
+        List.generate(
+          original.doseTimes.length,
+          (doseIndex) =>
+              original.doseTimes[doseIndex].hour !=
+                  updatedMed.doseTimes[doseIndex].hour ||
+              original.doseTimes[doseIndex].minute !=
+                  updatedMed.doseTimes[doseIndex].minute,
+        ).any((changed) => changed);
+    try {
+      await MedicationStorage.save(updated);
+    } catch (_) {
+      _showMessage(
+        'Changes could not be saved. The old schedule is unchanged.',
+      );
+      return;
+    }
+    if (mounted) setState(() => _medications = updated);
 
     // The number of doses and/or their times may have changed, so cancel
     // absolutely everything that could be scheduled for this medication's
@@ -596,28 +1013,27 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     // would otherwise keep pointing at dose index 1, even if that index now
     // means a completely different time of day. Then reschedule everything
     // fresh from the new dose list.
-    await NotificationService.instance.cancelAllForMedication(updatedMed.id);
-    await DueStatusStorage.clearForMedication(updatedMed.id);
-    _dueStatus = await DueStatusStorage.loadAll();
-
-    for (
-      var doseIndex = 0;
-      doseIndex < updatedMed.doseTimes.length;
-      doseIndex++
-    ) {
-      final doseTime = updatedMed.doseTimes[doseIndex];
-      await NotificationService.instance.scheduleDailyMedicationReminder(
-        id: NotificationService.doseNotificationBaseId(
+    var cleanupQueued = false;
+    try {
+      if (scheduleChanged) {
+        await MedicationStorage.queueNotificationCleanup(updatedMed.id);
+        cleanupQueued = true;
+        await DueStatusStorage.clearForMedication(updatedMed.id);
+        _dueStatus = await DueStatusStorage.loadAll();
+        await NotificationService.instance.cancelAllForMedication(
           updatedMed.id,
-          doseIndex,
-        ),
-        medicationName: updatedMed.name,
-        dosage: updatedMed.dosage,
-        hour: doseTime.hour,
-        minute: doseTime.minute,
+        );
+      }
+      await _scheduleDailyReminders(updatedMed);
+      await _scheduleReminderChain(updatedMed);
+      if (cleanupQueued) {
+        await MedicationStorage.completeNotificationCleanup(updatedMed.id);
+      }
+    } catch (_) {
+      _showMessage(
+        'Changes were saved, but some reminders could not be refreshed.',
       );
     }
-    await _scheduleReminderChain(updatedMed);
     _recomputeDue();
   }
 
@@ -627,13 +1043,51 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   /// taken/snoozed history.
   Future<void> _deleteMedication(int index) async {
     final removed = _medications[index];
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete medication?'),
+        content: Text(
+          'Delete ${removed.name} and all of its reminder times?',
+          style: const TextStyle(fontSize: 18),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Keep medication'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
     final updated = [..._medications]..removeAt(index);
-    setState(() => _medications = updated);
-    await MedicationStorage.save(updated);
-    await NotificationService.instance.cancelAllForMedication(removed.id);
-    await DueStatusStorage.clearForMedication(removed.id);
-    _dueStatus = await DueStatusStorage.loadAll();
-    _recomputeDue();
+    try {
+      await MedicationStorage.queueNotificationCleanup(removed.id);
+      await MedicationStorage.save(updated);
+      if (mounted) setState(() => _medications = updated);
+      try {
+        try {
+          await NotificationService.instance.cancelAllForMedication(removed.id);
+          await DueStatusStorage.clearForMedication(removed.id);
+          await MedicationStorage.completeNotificationCleanup(removed.id);
+          _dueStatus = await DueStatusStorage.loadAll();
+        } catch (_) {
+          rethrow;
+        }
+      } catch (_) {
+        _showMessage(
+          '${removed.name} was deleted, but an old reminder may still appear.',
+        );
+      }
+      _recomputeDue();
+    } catch (_) {
+      _showMessage('The medication could not be deleted. Please try again.');
+    }
   }
 
   @override
@@ -644,7 +1098,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         backgroundColor: const Color(0xFF1A4B8C), // deep blue = high contrast
         foregroundColor: Colors.white,
         title: const Text(
-          'My Medications',
+          'MediGuard',
           style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold),
         ),
         actions: [
@@ -670,11 +1124,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       // the full medication list below.
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
+          : _storageError != null
+          ? _buildStorageError()
           : Column(
               children: [
                 if (!_notificationsEnabled || !_exactAlarmsEnabled)
                   _buildPermissionBanner(),
-                if (_dueDoses.isNotEmpty) _buildDueSection(),
+                if (_dueDoses.isNotEmpty)
+                  Flexible(
+                    fit: FlexFit.loose,
+                    child: SingleChildScrollView(child: _buildDueSection()),
+                  ),
                 Expanded(
                   child: _medications.isEmpty
                       ? _buildEmptyState()
@@ -684,13 +1144,43 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ),
       // A large, labelled button so the action is obvious.
       floatingActionButton: FloatingActionButton.extended(
-        onPressed: _openAddForm,
+        onPressed: _storageError == null && !_actionInProgress
+            ? _openAddForm
+            : null,
         backgroundColor: const Color(0xFF1A4B8C),
         foregroundColor: Colors.white,
         icon: const Icon(Icons.add, size: 30),
         label: const Text(
           'Add Medication',
           style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildStorageError() {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.error_outline, size: 56, color: Colors.red),
+            const SizedBox(height: 16),
+            Text(
+              _storageError!,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 20),
+            ),
+            const SizedBox(height: 20),
+            ElevatedButton(
+              onPressed: () {
+                setState(() => _isLoading = true);
+                _loadMedications();
+              },
+              child: const Text('Retry'),
+            ),
+          ],
         ),
       ),
     );
@@ -1132,10 +1622,12 @@ class _DueMedicationCard extends StatelessWidget {
 /// A form screen for entering a new medication, or editing an existing one
 /// if [existing] is passed in.
 class AddMedicationScreen extends StatefulWidget {
-  const AddMedicationScreen({super.key, this.existing});
+  const AddMedicationScreen({super.key, this.existing, this.newMedicationId})
+    : assert(existing != null || newMedicationId != null);
 
   /// When editing, the medication being edited. Null when adding a new one.
   final Medication? existing;
+  final int? newMedicationId;
 
   @override
   State<AddMedicationScreen> createState() => _AddMedicationScreenState();
@@ -1148,20 +1640,21 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
   final _nameController = TextEditingController();
   final _dosageController = TextEditingController();
 
-  // How many times a day this medication is taken (1-5). Drives how many
+  // How many times a day this medication is taken (1-4). Drives how many
   // dose-time rows are shown below.
   int _timesPerDay = 1;
 
   // Only meaningful when _timesPerDay > 1: whether the user is setting
-  // times via "Even Intervals" (pick a start time + hours between doses,
-  // and let the app do the math) or "Custom Times" (pick every dose time
-  // by hand). Both modes end up filling the same `_doseTimes` list below,
-  // which is what's actually shown, individually tappable, and saved.
+  // times via "Even Intervals" (pick a start time and let the selected
+  // BID/TID/QID frequency determine the spacing) or "Custom Times" (pick
+  // every dose time by hand). Both modes end up filling the same `_doseTimes`
+  // list below, which is what's actually shown, individually tappable, and
+  // saved.
   bool _useEvenIntervals = true;
 
-  // Even-interval inputs.
+  // Even-spacing input. The interval is derived from the selected frequency:
+  // BID=12h, TID=8h, QID=6h. MediGuard never invents an arbitrary interval.
   TimeOfDay? _intervalStartTime;
-  int _intervalHours = 8;
 
   // The actual dose times — always exactly `_timesPerDay` entries long.
   // Null means "not picked yet" (only possible in Custom Times mode,
@@ -1176,8 +1669,13 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
   // The reminder-window choices offered to the user, in minutes.
   static const _windowOptions = [15, 30, 60];
 
-  // The "how many times a day" choices offered to the user.
-  static const _timesPerDayOptions = [1, 2, 3, 4, 5];
+  // New schedules use the four supported frequencies. A five-dose option is
+  // shown only while editing one saved by the student's previous version, so
+  // opening and saving it cannot silently discard the fifth time.
+  List<int> get _timesPerDayOptions =>
+      widget.existing != null && widget.existing!.doseTimes.length > 4
+      ? const [1, 2, 3, 4, 5]
+      : const [1, 2, 3, 4];
 
   bool get _isEditing => widget.existing != null;
 
@@ -1190,8 +1688,12 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
     if (existing != null) {
       _nameController.text = existing.name;
       _dosageController.text = existing.dosage;
-      _timesPerDay = existing.doseTimes.length.clamp(1, 5);
+      _timesPerDay = existing.doseTimes.length.clamp(
+        1,
+        NotificationService.maxDosesPerMedication,
+      );
       _doseTimes = existing.doseTimes
+          .take(_timesPerDay)
           .map((d) => TimeOfDay(hour: d.hour, minute: d.minute))
           .toList();
       // We don't know whether this medication was originally set up with
@@ -1251,25 +1753,17 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
     });
   }
 
-  /// Fills `_doseTimes` from `_intervalStartTime` + `_intervalHours`,
-  /// spacing doses evenly, wrapping past midnight if needed — e.g. a start
-  /// time of 8:00 AM, every 6 hours, 4 times a day gives 8:00 AM, 2:00 PM,
-  /// 8:00 PM, 2:00 AM. Until a start time has been picked, this just
-  /// resizes the list (see `_resizeDoseTimesList`) without inventing times.
+  /// Fills `_doseTimes` with true 24-hour even spacing for the chosen count.
   void _recalculateEvenIntervalTimes() {
     final start = _intervalStartTime;
     if (start == null) {
       _resizeDoseTimesList(_timesPerDay);
       return;
     }
-    var totalMinutes = start.hour * 60 + start.minute;
-    final times = <TimeOfDay?>[];
-    for (var i = 0; i < _timesPerDay; i++) {
-      final m = totalMinutes % (24 * 60);
-      times.add(TimeOfDay(hour: m ~/ 60, minute: m % 60));
-      totalMinutes += _intervalHours * 60;
-    }
-    _doseTimes = times;
+    _doseTimes = evenlySpacedDoseTimes(
+      start,
+      _timesPerDay,
+    ).map((time) => TimeOfDay(hour: time.hour, minute: time.minute)).toList();
   }
 
   Future<void> _pickIntervalStartTime() async {
@@ -1285,13 +1779,6 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
         _recalculateEvenIntervalTimes();
       });
     }
-  }
-
-  void _setIntervalHours(int hours) {
-    setState(() {
-      _intervalHours = hours;
-      _recalculateEvenIntervalTimes();
-    });
   }
 
   // ── Individual dose time rows (used by both modes) ─────────────────────
@@ -1348,7 +1835,7 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
     );
   }
 
-  /// The row of "Once a day" ... "5 times a day" choice buttons.
+  /// The row of once-daily, BID, TID, and QID choice buttons.
   Widget _buildTimesPerDaySelector() {
     return Wrap(
       spacing: 10,
@@ -1445,51 +1932,6 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
     );
   }
 
-  /// Big +/- stepper for "hours between doses", e.g. "Every 8 hours".
-  Widget _buildIntervalHoursStepper() {
-    return Row(
-      children: [
-        _stepperButton(
-          icon: Icons.remove,
-          onPressed: _intervalHours > 1
-              ? () => _setIntervalHours(_intervalHours - 1)
-              : null,
-        ),
-        Expanded(
-          child: Center(
-            child: Text(
-              'Every $_intervalHours hour${_intervalHours == 1 ? '' : 's'}',
-              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-              textAlign: TextAlign.center,
-            ),
-          ),
-        ),
-        _stepperButton(
-          icon: Icons.add,
-          onPressed: _intervalHours < 23
-              ? () => _setIntervalHours(_intervalHours + 1)
-              : null,
-        ),
-      ],
-    );
-  }
-
-  Widget _stepperButton({required IconData icon, required VoidCallback? onPressed}) {
-    return SizedBox(
-      width: 56,
-      height: 56,
-      child: OutlinedButton(
-        onPressed: onPressed,
-        style: OutlinedButton.styleFrom(
-          side: const BorderSide(color: Color(0xFF1A4B8C), width: 2),
-          shape: const CircleBorder(),
-          padding: EdgeInsets.zero,
-        ),
-        child: Icon(icon, size: 26, color: const Color(0xFF1A4B8C)),
-      ),
-    );
-  }
-
   /// One tappable dose-time row. Labeled "Time to Take" for a once-a-day
   /// medication (matching the original single-time form), or "Dose N Time"
   /// once there's more than one.
@@ -1509,10 +1951,7 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
           GestureDetector(
             onTap: () => _pickDoseTime(index),
             child: Container(
-              padding: const EdgeInsets.symmetric(
-                horizontal: 16,
-                vertical: 20,
-              ),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
               decoration: BoxDecoration(
                 border: Border.all(color: Colors.black54),
                 borderRadius: BorderRadius.circular(4),
@@ -1580,6 +2019,15 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
     final doseTimes = _doseTimes
         .map((t) => DoseTime(hour: t!.hour, minute: t.minute))
         .toList();
+    if (hasDuplicateDoseTimes(doseTimes)) {
+      _showValidationError('Each dose needs a different time.');
+      return;
+    }
+    doseTimes.sort(
+      (left, right) => (left.hour * 60 + left.minute).compareTo(
+        right.hour * 60 + right.minute,
+      ),
+    );
 
     // Send the new (or edited) medication back to HomeScreen. When editing,
     // keep the original id so it keeps using the same notification ids
@@ -1589,7 +2037,7 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
     Navigator.pop(
       context,
       Medication(
-        id: widget.existing?.id ?? generateMedicationId(),
+        id: widget.existing?.id ?? widget.newMedicationId!,
         name: _nameController.text.trim(),
         dosage: _dosageController.text.trim(),
         doseTimes: doseTimes,
@@ -1670,6 +2118,13 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
               ),
               const SizedBox(height: 10),
               _buildTimesPerDaySelector(),
+              const SizedBox(height: 10),
+              const Text(
+                'Use the frequency and exact times written on the prescription '
+                'or medication label. MediGuard does not decide when medicine '
+                'should be taken.',
+                style: TextStyle(fontSize: 15, color: Colors.black54),
+              ),
               const SizedBox(height: 28),
 
               // ── Even Intervals vs Custom Times (only if >1 dose) ────────
@@ -1691,17 +2146,10 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
                 const SizedBox(height: 8),
                 _buildIntervalStartTimeField(),
                 const SizedBox(height: 20),
-                const Text(
-                  'Hours Between Doses',
-                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
-                ),
-                const SizedBox(height: 8),
-                _buildIntervalHoursStepper(),
-                const SizedBox(height: 10),
-                const Text(
-                  'We calculated these times for you — tap any one below '
-                  'to fine-tune it.',
-                  style: TextStyle(fontSize: 15, color: Colors.black54),
+                Text(
+                  'Evenly spaced over a full day. Tap any time below to '
+                  'fine-tune it.',
+                  style: const TextStyle(fontSize: 15, color: Colors.black54),
                 ),
                 const SizedBox(height: 16),
               ],
