@@ -4,6 +4,7 @@ import 'package:app_settings/app_settings.dart'; // Opens the phone's Settings s
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart'; // For local storage
 import 'due_status_storage.dart'; // Tracks "taken today" / "snoozed" per dose
+import 'find_generic_screen.dart'; // "Find Generic" tab — brand-to-generic lookup
 import 'notification_service.dart'; // Schedules the medication reminders
 import 'welcome_screen.dart'; // First-launch welcome / disclaimer screen
 
@@ -271,7 +272,83 @@ class _AppEntryPointState extends State<AppEntryPoint> {
     if (_hasSeenWelcome == false) {
       return WelcomeScreen(isFirstLaunch: true, onContinue: _completeWelcome);
     }
-    return const HomeScreen();
+    return const MainNavScreen();
+  }
+}
+
+// ─── Main Navigation (Bottom Tab Bar) ──────────────────────────────────────
+
+/// The app's main screen once the welcome/disclaimer has been seen: a
+/// bottom navigation bar switching between the two top-level features —
+/// "My Medications" (the original home screen, unchanged) and "Find
+/// Generic" (brand-to-generic medicine lookup).
+///
+/// Each tab keeps its own AppBar/FloatingActionButton exactly as before;
+/// this widget only adds the bottom bar around them. We use an
+/// `IndexedStack` (instead of just swapping which widget is built) so both
+/// tabs' screens are created once and stay alive in the background when
+/// you switch away — important for "My Medications", which runs a
+/// due-dose-checking timer and needs to keep its loaded state.
+class MainNavScreen extends StatefulWidget {
+  const MainNavScreen({super.key});
+
+  @override
+  State<MainNavScreen> createState() => _MainNavScreenState();
+}
+
+class _MainNavScreenState extends State<MainNavScreen> {
+  int _selectedTabIndex = 0;
+
+  // The two tab screens, in the same order as the bottom nav items below.
+  static const _tabScreens = [HomeScreen(), FindGenericScreen()];
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: IndexedStack(index: _selectedTabIndex, children: _tabScreens),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _selectedTabIndex,
+        onDestinationSelected: (index) =>
+            setState(() => _selectedTabIndex = index),
+        // Large icons + always-visible labels + high-contrast selected
+        // colour make the two tabs easy to tell apart and easy to tap for
+        // older adults.
+        height: 72,
+        backgroundColor: Colors.white,
+        indicatorColor: const Color(0xFFE3EBF8),
+        labelTextStyle: WidgetStateProperty.resolveWith(
+          (states) => TextStyle(
+            fontSize: 14,
+            fontWeight: states.contains(WidgetState.selected)
+                ? FontWeight.bold
+                : FontWeight.normal,
+            color: states.contains(WidgetState.selected)
+                ? const Color(0xFF1A4B8C)
+                : Colors.black54,
+          ),
+        ),
+        destinations: const [
+          NavigationDestination(
+            icon: Icon(Icons.medication_outlined, size: 28),
+            selectedIcon: Icon(
+              Icons.medication,
+              size: 28,
+              color: Color(0xFF1A4B8C),
+            ),
+            label: 'My Medications',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.search_outlined, size: 28),
+            selectedIcon: Icon(
+              Icons.search,
+              size: 28,
+              color: Color(0xFF1A4B8C),
+            ),
+            label: 'Find Generic',
+          ),
+        ],
+      ),
+    );
   }
 }
 
