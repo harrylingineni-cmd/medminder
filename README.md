@@ -13,10 +13,17 @@ storage, and on-device reminders.
 - Repeat reminders every five minutes for a selected 15, 30, or 60 minute
   window
 - A ten-minute snooze with its own follow-up reminders
-- Local-only medication data; no account or server is required
+- An offline India brand-name lookup and a live US RxNorm lookup that asks the
+  user to confirm any approximate match
+- Local-only saved medication data; no account or MediGuard server is required
 
 MediGuard is a reminder tool, not medical advice. The frequency and exact times
 must come from the prescription, medication label, pharmacist, or clinician.
+The US Find Generic tab sends only the medicine name entered into that search
+box to the National Library of Medicine's RxNav service. It does not send the
+saved medication schedule, dosage, reminder history, or taken/snoozed status.
+MediGuard uses publicly available NLM data; NLM does not endorse or recommend
+the app and is not responsible for it.
 
 ## Run the project
 
