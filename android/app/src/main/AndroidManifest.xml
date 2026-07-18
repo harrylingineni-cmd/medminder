@@ -1,4 +1,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Required by the US Find Generic tab, which sends only the medicine
+         name the user searches for to the NLM RxNav service over HTTPS. -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+
     <!-- Lets the app show notifications at all (required at runtime on
          Android 13+ / API 33+; the app must also ask the user for this,
          which NotificationService.requestPermissions() does). -->

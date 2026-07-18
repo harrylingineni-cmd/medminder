@@ -18,6 +18,12 @@ void main() {
     expect(find.text('MediGuard'), findsOneWidget);
     expect(find.text('No medications yet'), findsOneWidget);
     expect(find.text('Add Medication'), findsOneWidget);
+    expect(find.text('Find Generic'), findsOneWidget);
+
+    await tester.tap(find.text('Find Generic'));
+    await tester.pumpAndSettle();
+    expect(find.text('Country'), findsOneWidget);
+    expect(find.text('United States'), findsOneWidget);
 
     await tester.pumpWidget(const SizedBox.shrink());
   });

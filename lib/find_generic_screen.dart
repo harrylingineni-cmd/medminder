@@ -23,10 +23,20 @@ import 'rxnav_service.dart';
 enum _Country { india, unitedStates }
 
 /// What the result area below the search box should currently show.
-enum _LookupStatus { idle, loading, found, notFound, error }
+enum _LookupStatus { idle, loading, confirmMatch, found, notFound, error }
+
+typedef UsGenericLookup = Future<RxNavLookupResult> Function(String searchTerm);
+
+Future<RxNavLookupResult> _defaultUsGenericLookup(String searchTerm) =>
+    RxNavService.lookupGeneric(searchTerm);
 
 class FindGenericScreen extends StatefulWidget {
-  const FindGenericScreen({super.key});
+  final UsGenericLookup lookupUnitedStates;
+
+  const FindGenericScreen({
+    super.key,
+    this.lookupUnitedStates = _defaultUsGenericLookup,
+  });
 
   @override
   State<FindGenericScreen> createState() => _FindGenericScreenState();
@@ -43,6 +53,8 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
   // card doesn't change while the user is still typing their NEXT search.
   String _searchedBrand = '';
   String? _genericResult;
+  String? _matchedMedicineName;
+  var _requestGeneration = 0;
 
   // Live "did you mean...?" suggestions shown under the search box as the
   // user types. Only used in India mode, since that's the only list we can
@@ -59,20 +71,30 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
 
   void _onCountryChanged(_Country country) {
     if (country == _country) return;
+    _requestGeneration++;
     setState(() {
       _country = country;
-      _status = _LookupStatus.idle;
+      _clearLookupResult();
       _suggestions = [];
       _searchController.clear();
     });
   }
 
   void _onSearchTextChanged(String value) {
+    _requestGeneration++;
     setState(() {
+      _clearLookupResult();
       _suggestions = _country == _Country.india
           ? suggestIndiaBrandNames(value)
           : const [];
     });
+  }
+
+  void _clearLookupResult() {
+    _status = _LookupStatus.idle;
+    _searchedBrand = '';
+    _genericResult = null;
+    _matchedMedicineName = null;
   }
 
   /// Runs a search using whatever's in the search box, or — when a
@@ -86,13 +108,13 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
       _searchController.text = brandNameOverride;
     }
 
+    _requestGeneration++;
     final generic = findIndiaGeneric(trimmed);
     setState(() {
       _searchedBrand = trimmed;
       _genericResult = generic;
-      _status = generic != null
-          ? _LookupStatus.found
-          : _LookupStatus.notFound;
+      _matchedMedicineName = trimmed;
+      _status = generic != null ? _LookupStatus.found : _LookupStatus.notFound;
       _suggestions = [];
     });
   }
@@ -102,28 +124,53 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
   /// and handle the not-found / network-error cases explicitly.
   Future<void> _searchUnitedStates() async {
     final trimmed = _searchController.text.trim();
-    if (trimmed.isEmpty) return;
+    if (trimmed.isEmpty || _status == _LookupStatus.loading) return;
+
+    final requestGeneration = ++_requestGeneration;
 
     setState(() {
       _searchedBrand = trimmed;
+      _genericResult = null;
+      _matchedMedicineName = null;
       _status = _LookupStatus.loading;
     });
 
-    final result = await RxNavService.lookupGeneric(trimmed);
-    if (!mounted) return; // Screen may have been closed while we waited.
+    final result = await widget.lookupUnitedStates(trimmed);
+    if (!mounted ||
+        requestGeneration != _requestGeneration ||
+        _country != _Country.unitedStates) {
+      return;
+    }
 
     setState(() {
       switch (result.outcome) {
         case RxNavLookupOutcome.found:
           _genericResult = result.genericName;
-          _status = _LookupStatus.found;
+          _matchedMedicineName = result.matchedMedicineName;
+          _status = result.requiresMatchConfirmation
+              ? _LookupStatus.confirmMatch
+              : _LookupStatus.found;
         case RxNavLookupOutcome.notFound:
           _genericResult = null;
+          _matchedMedicineName = null;
           _status = _LookupStatus.notFound;
         case RxNavLookupOutcome.networkError:
           _genericResult = null;
+          _matchedMedicineName = null;
           _status = _LookupStatus.error;
       }
+    });
+  }
+
+  void _confirmApproximateMatch() {
+    setState(() => _status = _LookupStatus.found);
+  }
+
+  void _rejectApproximateMatch() {
+    setState(() {
+      _status = _LookupStatus.notFound;
+      _genericResult = null;
+      _matchedMedicineName = null;
     });
   }
 
@@ -186,13 +233,9 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
   Widget _buildCountryToggle() {
     return Row(
       children: [
-        Expanded(
-          child: _countryButton('India', _Country.india),
-        ),
+        Expanded(child: _countryButton('India', _Country.india)),
         const SizedBox(width: 10),
-        Expanded(
-          child: _countryButton('United States', _Country.unitedStates),
-        ),
+        Expanded(child: _countryButton('United States', _Country.unitedStates)),
       ],
     );
   }
@@ -240,10 +283,11 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
                     icon: const Icon(Icons.clear, size: 26),
                     tooltip: 'Clear',
                     onPressed: () {
+                      _requestGeneration++;
                       _searchController.clear();
                       setState(() {
+                        _clearLookupResult();
                         _suggestions = [];
-                        _status = _LookupStatus.idle;
                       });
                     },
                   ),
@@ -311,6 +355,8 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
           padding: EdgeInsets.symmetric(vertical: 40),
           child: Center(child: CircularProgressIndicator()),
         );
+      case _LookupStatus.confirmMatch:
+        return _buildConfirmMatchCard();
       case _LookupStatus.found:
         return _buildFoundCard();
       case _LookupStatus.notFound:
@@ -318,6 +364,60 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
       case _LookupStatus.error:
         return _buildErrorCard();
     }
+  }
+
+  Widget _buildConfirmMatchCard() {
+    return Container(
+      margin: const EdgeInsets.only(top: 24),
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFF4E5),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: const Color(0xFFCC7A00), width: 2),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const Text(
+            'Check this possible match',
+            style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 12),
+          const Text(
+            'RxNorm found a similar medicine name. Only continue if this name matches the label or package exactly. This lookup cannot confirm the strength, form, or dose:',
+            style: TextStyle(fontSize: 17, height: 1.4),
+          ),
+          const SizedBox(height: 14),
+          _buildNameBlock(
+            label: 'Possible RxNorm match',
+            name: _matchedMedicineName ?? '',
+            icon: Icons.help_outline,
+          ),
+          const SizedBox(height: 16),
+          FilledButton(
+            onPressed: _confirmApproximateMatch,
+            style: FilledButton.styleFrom(
+              padding: const EdgeInsets.symmetric(vertical: 18),
+            ),
+            child: const Text(
+              'Yes, the name matches the label',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+          ),
+          const SizedBox(height: 8),
+          OutlinedButton(
+            onPressed: _rejectApproximateMatch,
+            style: OutlinedButton.styleFrom(
+              padding: const EdgeInsets.symmetric(vertical: 18),
+            ),
+            child: const Text(
+              'No, search again',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   /// The main "swap" result: brand name on top, an arrow, then the generic
@@ -335,8 +435,10 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           _buildNameBlock(
-            label: 'Brand name you searched',
-            name: _searchedBrand,
+            label: _country == _Country.unitedStates
+                ? 'Medicine matched by RxNorm'
+                : 'Brand name you searched',
+            name: _matchedMedicineName ?? _searchedBrand,
             icon: Icons.medication_outlined,
           ),
           const SizedBox(height: 10),
@@ -356,8 +458,7 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
           ),
           const SizedBox(height: 18),
           const Text(
-            'Same active ingredient — it works the same way in the body, '
-            'and usually costs less.',
+            'This is the active ingredient listed by the lookup source. It does not by itself prove that another product is an appropriate substitute.',
             style: TextStyle(fontSize: 18, height: 1.4),
           ),
           const SizedBox(height: 12),
@@ -372,7 +473,7 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
               SizedBox(width: 8),
               Expanded(
                 child: Text(
-                  'Ask your pharmacist for the generic version.',
+                  'Before switching, ask a pharmacist or doctor to confirm the exact medicine, strength, dosage form, and instructions.',
                   style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600),
                 ),
               ),
@@ -571,12 +672,19 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
           const SizedBox(height: 12),
           const Text(
             'This tool is for information only and is not medical advice. '
-            '"Same active ingredient" means the medicines work the same way '
-            'in the body — but brands can still differ in inactive '
-            'ingredients, dose form, or manufacturer. Always confirm with '
-            'your doctor or pharmacist before switching medicines.',
+            'A matching active ingredient alone does not confirm that two '
+            'products are interchangeable. Strength, dosage form, route, '
+            'release type, inactive ingredients, and instructions may differ. '
+            'Always confirm the exact product with a doctor or pharmacist.',
             style: TextStyle(fontSize: 17, height: 1.5),
           ),
+          if (_country == _Country.unitedStates) ...[
+            const SizedBox(height: 12),
+            const Text(
+              'US results use publicly available National Library of Medicine data. NLM does not endorse or recommend MediGuard and is not responsible for the app.',
+              style: TextStyle(fontSize: 15, height: 1.4),
+            ),
+          ],
         ],
       ),
     );
