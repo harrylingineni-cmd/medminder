@@ -44,15 +44,38 @@ class RxNavLookupResult {
   /// [outcome] is [RxNavLookupOutcome.found].
   final String? genericName;
 
-  const RxNavLookupResult._(this.outcome, this.genericName);
+  /// The exact medicine name RxNav matched the search to, e.g. "Aspirin
+  /// 325 MG Oral Tablet". Only set when [outcome] is
+  /// [RxNavLookupOutcome.found]. Always shown to the user so they can check
+  /// it against their label, but it especially matters when
+  /// [isApproximateMatch] is true — that's when it can differ from what
+  /// they typed.
+  final String? matchedName;
 
-  const RxNavLookupResult.found(String genericName)
-    : this._(RxNavLookupOutcome.found, genericName);
+  /// True when RxNav couldn't find an exact name match and this is its
+  /// closest guess instead (see `_findClosestRxcui`). The UI must not show
+  /// the generic ingredient for an approximate match until the user has
+  /// confirmed [matchedName] is actually their medicine.
+  final bool isApproximateMatch;
 
-  const RxNavLookupResult.notFound() : this._(RxNavLookupOutcome.notFound, null);
+  const RxNavLookupResult._(
+    this.outcome,
+    this.genericName,
+    this.matchedName,
+    this.isApproximateMatch,
+  );
+
+  const RxNavLookupResult.found({
+    required String genericName,
+    required String matchedName,
+    bool isApproximateMatch = false,
+  }) : this._(RxNavLookupOutcome.found, genericName, matchedName, isApproximateMatch);
+
+  const RxNavLookupResult.notFound()
+    : this._(RxNavLookupOutcome.notFound, null, null, false);
 
   const RxNavLookupResult.networkError()
-    : this._(RxNavLookupOutcome.networkError, null);
+    : this._(RxNavLookupOutcome.networkError, null, null, false);
 }
 
 class RxNavService {
@@ -69,14 +92,30 @@ class RxNavService {
     if (trimmed.isEmpty) return const RxNavLookupResult.notFound();
 
     try {
-      final rxcui =
-          await _findExactRxcui(trimmed) ?? await _findClosestRxcui(trimmed);
-      if (rxcui == null) return const RxNavLookupResult.notFound();
+      final exactRxcui = await _findExactRxcui(trimmed);
+      final String rxcui;
+      final String matchedName;
+      final bool isApproximate;
+      if (exactRxcui != null) {
+        rxcui = exactRxcui;
+        matchedName = trimmed;
+        isApproximate = false;
+      } else {
+        final closest = await _findClosestRxcui(trimmed);
+        if (closest == null) return const RxNavLookupResult.notFound();
+        rxcui = closest.rxcui;
+        matchedName = closest.name;
+        isApproximate = true;
+      }
 
       final ingredientNames = await _findIngredientNames(rxcui);
       if (ingredientNames.isEmpty) return const RxNavLookupResult.notFound();
 
-      return RxNavLookupResult.found(ingredientNames.join(' + '));
+      return RxNavLookupResult.found(
+        genericName: ingredientNames.join(' + '),
+        matchedName: matchedName,
+        isApproximateMatch: isApproximate,
+      );
     } on Exception {
       // Covers: no internet connection, DNS failure, request timeout, or an
       // unexpected/malformed response we couldn't parse. We deliberately
@@ -115,23 +154,42 @@ class RxNavService {
 
   /// Step 1b (fallback): https://rxnav.nlm.nih.gov/REST/approximateTerm.json
   /// Only called when `_findExactRxcui` found nothing. Finds the RxCUI that
-  /// most closely matches [term], for mis-spelled or less common names.
-  /// Returns null if nothing matched.
-  static Future<String?> _findClosestRxcui(String term) async {
-    final uri = Uri.parse(
+  /// most closely matches [term], for mis-spelled or less common names, and
+  /// then looks up that concept's actual RxNorm name — approximateTerm.json
+  /// doesn't return a name itself, only an id and a score. Returns null if
+  /// nothing matched.
+  ///
+  /// Callers must treat the result as a candidate to confirm with the user,
+  /// not a definite answer — see [RxNavLookupResult.isApproximateMatch].
+  static Future<({String rxcui, String name})?> _findClosestRxcui(
+    String term,
+  ) async {
+    final searchUri = Uri.parse(
       '$_baseUrl/approximateTerm.json'
       '?term=${Uri.encodeQueryComponent(term)}&maxEntries=1',
     );
-    final response = await http.get(uri).timeout(_timeout);
-    if (response.statusCode != 200) return null;
+    final searchResponse = await http.get(searchUri).timeout(_timeout);
+    if (searchResponse.statusCode != 200) return null;
 
-    final body = jsonDecode(response.body) as Map<String, dynamic>;
-    final group = body['approximateGroup'] as Map<String, dynamic>?;
+    final searchBody = jsonDecode(searchResponse.body) as Map<String, dynamic>;
+    final group = searchBody['approximateGroup'] as Map<String, dynamic>?;
     final candidates = group?['candidate'] as List?;
     if (candidates == null || candidates.isEmpty) return null;
 
     final firstCandidate = candidates.first as Map<String, dynamic>;
-    return firstCandidate['rxcui'] as String?;
+    final rxcui = firstCandidate['rxcui'] as String?;
+    if (rxcui == null) return null;
+
+    final nameUri = Uri.parse('$_baseUrl/rxcui/$rxcui/properties.json');
+    final nameResponse = await http.get(nameUri).timeout(_timeout);
+    if (nameResponse.statusCode != 200) return null;
+
+    final nameBody = jsonDecode(nameResponse.body) as Map<String, dynamic>;
+    final properties = nameBody['properties'] as Map<String, dynamic>?;
+    final name = properties?['name'] as String?;
+    if (name == null || name.trim().isEmpty) return null;
+
+    return (rxcui: rxcui, name: name.trim());
   }
 
   /// Step 2: `https://rxnav.nlm.nih.gov/REST/rxcui/<rxcui>/related.json?tty=IN+MIN`

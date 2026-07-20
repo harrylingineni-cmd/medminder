@@ -23,7 +23,7 @@ import 'rxnav_service.dart';
 enum _Country { india, unitedStates }
 
 /// What the result area below the search box should currently show.
-enum _LookupStatus { idle, loading, found, notFound, error }
+enum _LookupStatus { idle, loading, confirmMatch, found, notFound, error }
 
 class FindGenericScreen extends StatefulWidget {
   const FindGenericScreen({super.key});
@@ -44,6 +44,11 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
   String _searchedBrand = '';
   String? _genericResult;
 
+  // The exact medicine name RxNav (or the India list) matched to. Shown in
+  // the result card, and — for an approximate US match — shown on its own
+  // in a confirmation step before the generic ingredient is ever revealed.
+  String? _matchedMedicineName;
+
   // Live "did you mean...?" suggestions shown under the search box as the
   // user types. Only used in India mode, since that's the only list we can
   // search instantly/offline; US mode has nothing to suggest from locally.
@@ -62,6 +67,7 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
     setState(() {
       _country = country;
       _status = _LookupStatus.idle;
+      _matchedMedicineName = null;
       _suggestions = [];
       _searchController.clear();
     });
@@ -90,6 +96,7 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
     setState(() {
       _searchedBrand = trimmed;
       _genericResult = generic;
+      _matchedMedicineName = trimmed;
       _status = generic != null
           ? _LookupStatus.found
           : _LookupStatus.notFound;
@@ -106,6 +113,7 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
 
     setState(() {
       _searchedBrand = trimmed;
+      _matchedMedicineName = null;
       _status = _LookupStatus.loading;
     });
 
@@ -116,7 +124,13 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
       switch (result.outcome) {
         case RxNavLookupOutcome.found:
           _genericResult = result.genericName;
-          _status = _LookupStatus.found;
+          _matchedMedicineName = result.matchedName;
+          // An approximate match is RxNav's best guess, not a confirmed
+          // answer — the generic ingredient must stay hidden until the
+          // user has checked the matched name against their own label.
+          _status = result.isApproximateMatch
+              ? _LookupStatus.confirmMatch
+              : _LookupStatus.found;
         case RxNavLookupOutcome.notFound:
           _genericResult = null;
           _status = _LookupStatus.notFound;
@@ -124,6 +138,22 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
           _genericResult = null;
           _status = _LookupStatus.error;
       }
+    });
+  }
+
+  /// User tapped "Yes, this is my medicine" on the approximate-match
+  /// confirmation card — now it's safe to reveal the generic ingredient.
+  void _confirmMatchedMedicine() {
+    setState(() => _status = _LookupStatus.found);
+  }
+
+  /// User tapped "No, search again" — go back to not-found rather than
+  /// showing a possibly-wrong generic ingredient.
+  void _rejectMatchedMedicine() {
+    setState(() {
+      _status = _LookupStatus.notFound;
+      _genericResult = null;
+      _matchedMedicineName = null;
     });
   }
 
@@ -244,6 +274,7 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
                       setState(() {
                         _suggestions = [];
                         _status = _LookupStatus.idle;
+                        _matchedMedicineName = null;
                       });
                     },
                   ),
@@ -311,6 +342,8 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
           padding: EdgeInsets.symmetric(vertical: 40),
           child: Center(child: CircularProgressIndicator()),
         );
+      case _LookupStatus.confirmMatch:
+        return _buildConfirmMatchCard();
       case _LookupStatus.found:
         return _buildFoundCard();
       case _LookupStatus.notFound:
@@ -318,6 +351,89 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
       case _LookupStatus.error:
         return _buildErrorCard();
     }
+  }
+
+  /// Shown only for an approximate US match, before the generic ingredient
+  /// is revealed. Large text and two big, clearly-labelled buttons — no
+  /// small print to misread, no default selected so a stray tap can't
+  /// accidentally confirm the wrong medicine.
+  Widget _buildConfirmMatchCard() {
+    return Container(
+      margin: const EdgeInsets.only(top: 24),
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFF4E5),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: const Color(0xFFCC7A00), width: 2),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.help_outline, color: Colors.orange.shade900, size: 28),
+              const SizedBox(width: 10),
+              const Expanded(
+                child: Text(
+                  'Is this your medicine?',
+                  style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          const Text(
+            'We could not find an exact match for what you typed. This is '
+            'the closest medicine name we found:',
+            style: TextStyle(fontSize: 17, height: 1.4),
+          ),
+          const SizedBox(height: 14),
+          _buildNameBlock(
+            label: 'Closest match found',
+            name: _matchedMedicineName ?? '',
+            icon: Icons.medication_outlined,
+          ),
+          const SizedBox(height: 18),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton(
+              onPressed: _confirmMatchedMedicine,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF1A4B8C),
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 20),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+              child: const Text(
+                'Yes, this is my medicine',
+                style: TextStyle(fontSize: 19, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton(
+              onPressed: _rejectMatchedMedicine,
+              style: OutlinedButton.styleFrom(
+                foregroundColor: const Color(0xFF1A4B8C),
+                side: const BorderSide(color: Color(0xFF1A4B8C), width: 2),
+                padding: const EdgeInsets.symmetric(vertical: 20),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+              child: const Text(
+                'No, that is not it',
+                style: TextStyle(fontSize: 19, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   /// The main "swap" result: brand name on top, an arrow, then the generic
@@ -335,8 +451,10 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           _buildNameBlock(
-            label: 'Brand name you searched',
-            name: _searchedBrand,
+            label: _country == _Country.unitedStates
+                ? 'Medicine matched'
+                : 'Brand name you searched',
+            name: _matchedMedicineName ?? _searchedBrand,
             icon: Icons.medication_outlined,
           ),
           const SizedBox(height: 10),
