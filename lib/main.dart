@@ -698,6 +698,82 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _recomputeDue();
   }
 
+  /// Ask the user to confirm before deleting, since it cannot be undone and
+  /// also stops all of the medication's reminders. Only calls
+  /// [_deleteMedication] if they tap "Delete".
+  Future<void> _confirmDeleteMedication(int index) async {
+    final medication = _medications[index];
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text(
+          'Delete this medication?',
+          style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+        ),
+        content: Text(
+          '${medication.name} will be removed and its reminders will '
+          'stop. This cannot be undone.',
+          style: const TextStyle(fontSize: 18, height: 1.4),
+        ),
+        actionsPadding: const EdgeInsets.fromLTRB(24, 0, 24, 20),
+        actions: [
+          Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // "Keep medication" first and in the app's normal blue, so
+              // the safe choice is the natural, prominent default.
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
+                  onPressed: () => Navigator.pop(context, false),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF1A4B8C),
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                  ),
+                  child: const Text(
+                    'Keep Medication',
+                    style:
+                        TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              // "Delete" is red so it's unmistakably the destructive option.
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
+                  onPressed: () => Navigator.pop(context, true),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.red.shade700,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                  ),
+                  child: const Text(
+                    'Delete',
+                    style:
+                        TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true) {
+      await _deleteMedication(index);
+    }
+  }
+
   /// Remove the medication at [index] from the list, save, and stop all of
   /// its reminder notifications (every dose's daily reminder, any pending
   /// snooze, and every dose's repeat-until-confirmed chain), and forget its
@@ -910,7 +986,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       itemBuilder: (context, index) {
         return _MedicationCard(
           medication: _medications[index],
-          onDelete: () => _deleteMedication(index),
+          onDelete: () => _confirmDeleteMedication(index),
           onTap: () => _editMedication(index),
         );
       },
