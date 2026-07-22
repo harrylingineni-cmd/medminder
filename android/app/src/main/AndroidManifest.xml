@@ -25,7 +25,7 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
 
     <application
-        android:label="med_app"
+        android:label="MediGuard"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity

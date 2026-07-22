@@ -87,18 +87,23 @@ class DueStatusStorage {
   static Future<void> _saveAll(Map<DoseKey, DueStatusEntry> all) async {
     final prefs = await SharedPreferences.getInstance();
     final jsonStrings = all.values.map((e) => jsonEncode(e.toJson())).toList();
-    await prefs.setStringList(_storageKey, jsonStrings);
+    final saved = await prefs.setStringList(_storageKey, jsonStrings);
+    if (!saved) throw StateError('Dose status could not be saved.');
   }
 
   /// Record that dose [doseIndex] of [medicationId] was taken today. This
   /// clears any snooze on that specific dose, since it's now been dealt
   /// with. Other doses of the same medication are untouched.
-  static Future<void> markTakenToday(int medicationId, int doseIndex) async {
+  static Future<void> markTakenToday(
+    int medicationId,
+    int doseIndex, {
+    DateTime? when,
+  }) async {
     final all = await loadAll();
     all[(medicationId, doseIndex)] = DueStatusEntry(
       medicationId: medicationId,
       doseIndex: doseIndex,
-      takenDate: todayString(),
+      takenDate: todayString(when),
       snoozeUntilMillis: null,
     );
     await _saveAll(all);
@@ -135,6 +140,25 @@ class DueStatusStorage {
     await _saveAll(all);
   }
 
+  /// Moves persisted dose state when an older medication id is migrated to
+  /// the compact notification-id range used by current releases.
+  static Future<void> remapMedicationIds(Map<int, int> replacements) async {
+    if (replacements.isEmpty) return;
+    final all = await loadAll();
+    final remapped = <DoseKey, DueStatusEntry>{};
+    for (final entry in all.values) {
+      final medicationId =
+          replacements[entry.medicationId] ?? entry.medicationId;
+      remapped[(medicationId, entry.doseIndex)] = DueStatusEntry(
+        medicationId: medicationId,
+        doseIndex: entry.doseIndex,
+        takenDate: entry.takenDate,
+        snoozeUntilMillis: entry.snoozeUntilMillis,
+      );
+    }
+    await _saveAll(remapped);
+  }
+
   /// Today's date as "yyyy-MM-dd", used to check/record `takenDate`.
   static String todayString([DateTime? when]) {
     final d = when ?? DateTime.now();
@@ -158,16 +182,23 @@ class DueStatusStorage {
 bool isMedicationDue({
   required int hour,
   required int minute,
+  required int reminderWindowMinutes,
   required DueStatusEntry? status,
   required DateTime now,
 }) {
   final scheduledToday = DateTime(now.year, now.month, now.day, hour, minute);
-  if (now.isBefore(scheduledToday)) {
-    return false; // Scheduled time hasn't happened yet today.
+  final scheduledOccurrence = !now.isBefore(scheduledToday)
+      ? scheduledToday
+      : scheduledToday.subtract(const Duration(days: 1));
+  if (now.isBefore(scheduledToday) &&
+      !now.isBefore(
+        scheduledOccurrence.add(Duration(minutes: reminderWindowMinutes)),
+      )) {
+    return false; // Today's dose is not due and yesterday's window is over.
   }
 
-  if (status?.takenDate == DueStatusStorage.todayString(now)) {
-    return false; // Already taken today.
+  if (status?.takenDate == DueStatusStorage.todayString(scheduledOccurrence)) {
+    return false; // This scheduled occurrence was already taken.
   }
 
   final snoozeUntilMillis = status?.snoozeUntilMillis;
