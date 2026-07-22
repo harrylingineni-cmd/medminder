@@ -40,6 +40,20 @@ void main() {
     expect(find.text('5 times a day'), findsNothing);
   });
 
+  testWidgets('add form requires a medication name and dosage', (tester) async {
+    await tester.pumpWidget(
+      const MaterialApp(home: AddMedicationScreen(newMedicationId: 1000)),
+    );
+
+    final saveButton = find.text('Save Medication');
+    await tester.ensureVisible(saveButton);
+    await tester.tap(saveButton);
+    await tester.pumpAndSettle();
+
+    expect(find.text('Please enter the medication name.'), findsOneWidget);
+    expect(find.text('Please enter the dosage.'), findsOneWidget);
+  });
+
   testWidgets('taking one due dose leaves the other dose due', (tester) async {
     SharedPreferences.setMockInitialValues({
       'has_seen_welcome': true,
@@ -90,6 +104,13 @@ void main() {
     );
     expect(find.text('Retry'), findsOneWidget);
 
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('medications', []);
+    await tester.tap(find.text('Retry'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('No medications yet'), findsOneWidget);
+
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
@@ -129,6 +150,37 @@ void main() {
       ),
       completion(isEmpty),
     );
+
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('keeping a medication cancels deletion', (tester) async {
+    SharedPreferences.setMockInitialValues({
+      'has_seen_welcome': true,
+      'medications': [
+        jsonEncode({
+          'id': 1000,
+          'name': 'Example',
+          'dosage': '10 mg',
+          'doseTimes': [
+            {'hour': 8, 'minute': 0},
+          ],
+          'reminderWindowMinutes': 30,
+        }),
+      ],
+    });
+    await tester.pumpWidget(const MedTrackerApp());
+    await tester.pumpAndSettle();
+
+    final deleteButton = find.byIcon(Icons.delete_outline);
+    await tester.ensureVisible(deleteButton);
+    await tester.tap(deleteButton);
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(ElevatedButton, 'Keep Medication'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Delete this medication?'), findsNothing);
+    expect(find.text('Example'), findsWidgets);
 
     await tester.pumpWidget(const SizedBox.shrink());
   });

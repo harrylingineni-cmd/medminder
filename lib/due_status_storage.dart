@@ -182,16 +182,23 @@ class DueStatusStorage {
 bool isMedicationDue({
   required int hour,
   required int minute,
+  required int reminderWindowMinutes,
   required DueStatusEntry? status,
   required DateTime now,
 }) {
   final scheduledToday = DateTime(now.year, now.month, now.day, hour, minute);
-  if (now.isBefore(scheduledToday)) {
-    return false; // Scheduled time hasn't happened yet today.
+  final scheduledOccurrence = !now.isBefore(scheduledToday)
+      ? scheduledToday
+      : scheduledToday.subtract(const Duration(days: 1));
+  if (now.isBefore(scheduledToday) &&
+      !now.isBefore(
+        scheduledOccurrence.add(Duration(minutes: reminderWindowMinutes)),
+      )) {
+    return false; // Today's dose is not due and yesterday's window is over.
   }
 
-  if (status?.takenDate == DueStatusStorage.todayString(now)) {
-    return false; // Already taken today.
+  if (status?.takenDate == DueStatusStorage.todayString(scheduledOccurrence)) {
+    return false; // This scheduled occurrence was already taken.
   }
 
   final snoozeUntilMillis = status?.snoozeUntilMillis;

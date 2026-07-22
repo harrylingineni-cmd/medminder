@@ -82,4 +82,27 @@ void main() {
       firstAllocated + NotificationService.medicationIdSpace,
     );
   });
+
+  test('pending notification cleanup survives until completion', () async {
+    await MedicationStorage.queueNotificationCleanup(1000);
+    await MedicationStorage.queueDoseNotificationCleanup(2000);
+
+    expect(
+      await MedicationStorage.pendingNotificationCleanupIds(),
+      contains(1000),
+    );
+    expect(
+      await MedicationStorage.pendingDoseNotificationCleanupIds(),
+      contains(2000),
+    );
+
+    await MedicationStorage.completeNotificationCleanup(1000);
+    await MedicationStorage.completeDoseNotificationCleanup(2000);
+
+    expect(await MedicationStorage.pendingNotificationCleanupIds(), isEmpty);
+    expect(
+      await MedicationStorage.pendingDoseNotificationCleanupIds(),
+      isEmpty,
+    );
+  });
 }

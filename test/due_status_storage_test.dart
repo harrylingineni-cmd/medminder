@@ -20,6 +20,7 @@ void main() {
       isMedicationDue(
         hour: 8,
         minute: 0,
+        reminderWindowMinutes: 30,
         status: statuses[(1000, 0)],
         now: now,
       ),
@@ -29,6 +30,7 @@ void main() {
       isMedicationDue(
         hour: 8,
         minute: 0,
+        reminderWindowMinutes: 30,
         status: statuses[(1000, 1)],
         now: now,
       ),
@@ -46,15 +48,74 @@ void main() {
     final status = (await DueStatusStorage.loadAll())[(1000, 0)];
 
     expect(
-      isMedicationDue(hour: 8, minute: 0, status: status, now: now),
+      isMedicationDue(
+        hour: 8,
+        minute: 0,
+        reminderWindowMinutes: 30,
+        status: status,
+        now: now,
+      ),
       isFalse,
     );
     expect(
       isMedicationDue(
         hour: 8,
         minute: 0,
+        reminderWindowMinutes: 30,
         status: status,
         now: now.add(const Duration(minutes: 11)),
+      ),
+      isTrue,
+    );
+  });
+
+  test('a late dose stays due across midnight until its window ends', () {
+    expect(
+      isMedicationDue(
+        hour: 23,
+        minute: 55,
+        reminderWindowMinutes: 60,
+        status: null,
+        now: DateTime(2026, 7, 16, 0, 30),
+      ),
+      isTrue,
+    );
+    expect(
+      isMedicationDue(
+        hour: 23,
+        minute: 55,
+        reminderWindowMinutes: 30,
+        status: null,
+        now: DateTime(2026, 7, 16, 0, 30),
+      ),
+      isFalse,
+    );
+  });
+
+  test('taking a late dose after midnight applies to its scheduled date', () {
+    final status = DueStatusEntry(
+      medicationId: 1000,
+      doseIndex: 0,
+      takenDate: '2026-07-15',
+    );
+
+    expect(
+      isMedicationDue(
+        hour: 23,
+        minute: 55,
+        reminderWindowMinutes: 60,
+        status: status,
+        now: DateTime(2026, 7, 16, 0, 5),
+      ),
+      isFalse,
+    );
+    expect(
+      isMedicationDue(
+        hour: 23,
+        minute: 55,
+        reminderWindowMinutes: 60,
+        status: status,
+        now: DateTime(2026, 7, 16, 23, 56),
       ),
       isTrue,
     );

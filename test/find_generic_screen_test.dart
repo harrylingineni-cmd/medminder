@@ -11,6 +11,21 @@ Future<void> selectUnitedStates(WidgetTester tester) async {
 }
 
 void main() {
+  testWidgets('India suggestions can be tapped to show an offline result', (
+    tester,
+  ) async {
+    await tester.pumpWidget(const MaterialApp(home: FindGenericScreen()));
+
+    await tester.enterText(find.byType(TextField), 'Cro');
+    await tester.pump();
+    expect(find.text('Crocin'), findsOneWidget);
+
+    await tester.tap(find.text('Crocin'));
+    await tester.pump();
+
+    expect(find.text('Paracetamol'), findsOneWidget);
+  });
+
   testWidgets('requires confirmation before showing an approximate generic', (
     tester,
   ) async {
@@ -41,6 +56,41 @@ void main() {
     await tester.pump();
 
     expect(find.text('Simvastatin'), findsOneWidget);
+  });
+
+  testWidgets('rejecting an approximate match never reveals its ingredient', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: FindGenericScreen(
+          lookupUnitedStates: (_) async => const RxNavLookupResult.found(
+            genericName: 'Simvastatin',
+            matchedMedicineName: 'Zocor',
+            requiresMatchConfirmation: true,
+          ),
+        ),
+      ),
+    );
+    await selectUnitedStates(tester);
+    await tester.enterText(find.byType(TextField), 'Zocorr');
+    await tester.tap(find.widgetWithText(ElevatedButton, 'Search'));
+    await tester.pumpAndSettle();
+
+    final rejectButton = find.text('No, that is not it');
+    await tester.ensureVisible(rejectButton);
+    await tester.tap(rejectButton);
+    await tester.pump();
+
+    expect(find.text('Simvastatin'), findsNothing);
+    expect(find.textContaining("We couldn't find"), findsOneWidget);
+
+    final clearButton = find.byTooltip('Clear');
+    await tester.ensureVisible(clearButton);
+    await tester.pumpAndSettle();
+    await tester.tap(clearButton);
+    await tester.pumpAndSettle();
+    expect(find.textContaining("We couldn't find"), findsNothing);
   });
 
   testWidgets('ignores a US response after the user switches countries', (
@@ -124,11 +174,20 @@ void main() {
   testWidgets('shows a recoverable error when RxNav cannot be reached', (
     tester,
   ) async {
+    var lookupCount = 0;
     await tester.pumpWidget(
       MaterialApp(
         home: FindGenericScreen(
-          lookupUnitedStates: (_) async =>
-              const RxNavLookupResult.networkError(),
+          lookupUnitedStates: (_) async {
+            lookupCount++;
+            if (lookupCount == 1) {
+              return const RxNavLookupResult.networkError();
+            }
+            return const RxNavLookupResult.found(
+              genericName: 'Ibuprofen',
+              matchedMedicineName: 'Advil',
+            );
+          },
         ),
       ),
     );
@@ -139,5 +198,9 @@ void main() {
 
     expect(find.text("Couldn't reach the lookup service"), findsOneWidget);
     expect(find.text('Try Again'), findsOneWidget);
+
+    await tester.tap(find.text('Try Again'));
+    await tester.pumpAndSettle();
+    expect(find.text('Ibuprofen'), findsOneWidget);
   });
 }

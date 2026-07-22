@@ -151,4 +151,38 @@ void main() {
     expect(ids, hasLength(NotificationService.maxDosesPerMedication * 2 * 26));
     expect(ids.every((id) => id >= -0x80000000 && id <= 0x7fffffff), isTrue);
   });
+
+  test('snooze collision checks use the next dose across the schedule', () {
+    final nextDose = nextMedicationDoseAfter(const [
+      DoseTime(hour: 8, minute: 0),
+      DoseTime(hour: 14, minute: 0),
+      DoseTime(hour: 20, minute: 0),
+    ], DateTime(2026, 7, 15, 13, 55));
+
+    expect(nextDose, DateTime(2026, 7, 15, 14));
+  });
+
+  test('an expired reminder chain advances to the next occurrence', () {
+    final anchor = reminderChainAnchor(
+      doseTime: const DoseTime(hour: 8, minute: 0),
+      now: DateTime(2026, 7, 15, 9, 1),
+      reminderWindowMinutes: 60,
+      takenDate: null,
+      snoozeSeriesActive: false,
+    );
+
+    expect(anchor, DateTime(2026, 7, 16, 8));
+  });
+
+  test('a reminder chain crossing midnight keeps its original occurrence', () {
+    final anchor = reminderChainAnchor(
+      doseTime: const DoseTime(hour: 23, minute: 55),
+      now: DateTime(2026, 7, 16, 0, 30),
+      reminderWindowMinutes: 60,
+      takenDate: null,
+      snoozeSeriesActive: false,
+    );
+
+    expect(anchor, DateTime(2026, 7, 15, 23, 55));
+  });
 }

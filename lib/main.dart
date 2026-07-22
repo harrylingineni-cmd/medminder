@@ -88,6 +88,79 @@ bool hasDuplicateDoseTimes(Iterable<DoseTime> times) {
   return false;
 }
 
+DateTime _doseTimeOnDate(DoseTime doseTime, DateTime date) =>
+    DateTime(date.year, date.month, date.day, doseTime.hour, doseTime.minute);
+
+/// The earliest upcoming dose across the medication's whole schedule.
+DateTime nextMedicationDoseAfter(Iterable<DoseTime> doseTimes, DateTime now) {
+  DateTime? earliest;
+  for (final doseTime in doseTimes) {
+    var candidate = _doseTimeOnDate(doseTime, now);
+    if (!candidate.isAfter(now)) {
+      candidate = candidate.add(const Duration(days: 1));
+    }
+    if (earliest == null || candidate.isBefore(earliest)) {
+      earliest = candidate;
+    }
+  }
+  if (earliest == null) {
+    throw ArgumentError.value(doseTimes, 'doseTimes', 'must not be empty');
+  }
+  return earliest;
+}
+
+/// The scheduled occurrence represented by a due card right now.
+///
+/// A dose normally belongs to today's schedule. Just after midnight, a late
+/// dose from yesterday remains active until its reminder window ends instead
+/// of disappearing because the calendar date changed.
+DateTime? dueDoseOccurrence({
+  required DoseTime doseTime,
+  required DateTime now,
+  required int reminderWindowMinutes,
+}) {
+  final scheduledToday = _doseTimeOnDate(doseTime, now);
+  if (!now.isBefore(scheduledToday)) return scheduledToday;
+
+  final scheduledYesterday = scheduledToday.subtract(const Duration(days: 1));
+  final previousWindowEnds = scheduledYesterday.add(
+    Duration(minutes: reminderWindowMinutes),
+  );
+  return now.isBefore(previousWindowEnds) ? scheduledYesterday : null;
+}
+
+/// Picks the one dose occurrence whose one-off follow-up reminders should be
+/// pending. Once an occurrence's window ends (or it is handled), move to the
+/// next day rather than clearing the IDs without preparing the next chain.
+DateTime reminderChainAnchor({
+  required DoseTime doseTime,
+  required DateTime now,
+  required int reminderWindowMinutes,
+  required String? takenDate,
+  required bool snoozeSeriesActive,
+}) {
+  final activeOccurrence = dueDoseOccurrence(
+    doseTime: doseTime,
+    now: now,
+    reminderWindowMinutes: reminderWindowMinutes,
+  );
+  final activeWindowEnds = activeOccurrence?.add(
+    Duration(minutes: reminderWindowMinutes),
+  );
+  final activeChainStillRunning =
+      activeWindowEnds != null && now.isBefore(activeWindowEnds);
+  final activeOccurrenceTaken =
+      activeOccurrence != null &&
+      takenDate == DueStatusStorage.todayString(activeOccurrence);
+
+  if (activeChainStillRunning &&
+      !activeOccurrenceTaken &&
+      !snoozeSeriesActive) {
+    return activeOccurrence!;
+  }
+  return nextMedicationDoseAfter([doseTime], now);
+}
+
 // ─── Data Model ────────────────────────────────────────────────────────────
 
 /// One time of day a medication should be taken. A medication now has a
@@ -766,23 +839,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         );
 
     final doseTime = medication.doseTimes[doseIndex];
-    var anchor = DateTime(
-      now.year,
-      now.month,
-      now.day,
-      doseTime.hour,
-      doseTime.minute,
+    final anchor = reminderChainAnchor(
+      doseTime: doseTime,
+      now: now,
+      reminderWindowMinutes: medication.reminderWindowMinutes,
+      takenDate: status?.takenDate,
+      snoozeSeriesActive: snoozeSeriesActive,
     );
-    final takenToday = status?.takenDate == DueStatusStorage.todayString(now);
-    if (takenToday || snoozeSeriesActive) {
-      anchor = DateTime(
-        now.year,
-        now.month,
-        now.day + 1,
-        doseTime.hour,
-        doseTime.minute,
-      );
-    }
 
     await NotificationService.instance.scheduleRepeatReminders(
       id: NotificationService.doseNotificationBaseId(medication.id, doseIndex),
@@ -833,6 +896,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         final isDue = isMedicationDue(
           hour: doseTime.hour,
           minute: doseTime.minute,
+          reminderWindowMinutes: medication.reminderWindowMinutes,
           status: _dueStatus[(medication.id, doseIndex)],
           now: now,
         );
@@ -858,7 +922,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
     try {
       await MedicationStorage.queueDoseNotificationCleanup(doseId);
-      await DueStatusStorage.markTakenToday(medication.id, doseIndex);
+      final now = DateTime.now();
+      final occurrence = dueDoseOccurrence(
+        doseTime: medication.doseTimes[doseIndex],
+        now: now,
+        reminderWindowMinutes: medication.reminderWindowMinutes,
+      );
+      await DueStatusStorage.markTakenToday(
+        medication.id,
+        doseIndex,
+        when: occurrence ?? now,
+      );
       _dueStatus = await DueStatusStorage.loadAll();
       _recomputeDue();
       try {
@@ -887,25 +961,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   /// minutes from now, just for this dose.
   Future<void> _snooze(Medication medication, int doseIndex) async {
     if (_actionInProgress) return;
-    final snoozeUntil = DateTime.now().add(const Duration(minutes: 10));
-    final doseTime = medication.doseTimes[doseIndex];
     final now = DateTime.now();
-    var nextDose = DateTime(
-      now.year,
-      now.month,
-      now.day,
-      doseTime.hour,
-      doseTime.minute,
-    );
-    if (!nextDose.isAfter(now)) {
-      nextDose = DateTime(
-        now.year,
-        now.month,
-        now.day + 1,
-        doseTime.hour,
-        doseTime.minute,
-      );
-    }
+    final snoozeUntil = now.add(const Duration(minutes: 10));
+    final nextDose = nextMedicationDoseAfter(medication.doseTimes, now);
     final snoozeSeriesEnds = snoozeUntil.add(
       Duration(minutes: medication.reminderWindowMinutes),
     );
@@ -2252,7 +2310,7 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
                 'Use the frequency and exact times written on the prescription '
                 'or medication label. MediGuard does not decide when medicine '
                 'should be taken.',
-                style: TextStyle(fontSize: 15, color: Colors.black54),
+                style: TextStyle(fontSize: 16, color: Colors.black54),
               ),
               const SizedBox(height: 28),
 
@@ -2278,7 +2336,7 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
                 Text(
                   'Evenly spaced over a full day. Tap any time below to '
                   'fine-tune it.',
-                  style: const TextStyle(fontSize: 15, color: Colors.black54),
+                  style: const TextStyle(fontSize: 16, color: Colors.black54),
                 ),
                 const SizedBox(height: 16),
               ],

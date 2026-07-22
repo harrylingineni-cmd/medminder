@@ -719,7 +719,7 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
             const SizedBox(height: 12),
             const Text(
               'US results use publicly available National Library of Medicine data. NLM does not endorse or recommend MediGuard and is not responsible for the app.',
-              style: TextStyle(fontSize: 15, height: 1.4),
+              style: TextStyle(fontSize: 16, height: 1.4),
             ),
           ],
         ],

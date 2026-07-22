@@ -143,6 +143,136 @@ void main() {
     expect(result.requiresMatchConfirmation, isTrue);
   });
 
+  test('normalized exact matching is tried after strict matching', () async {
+    final searchModes = <String>[];
+    final client = MockClient((request) async {
+      if (request.url.path == '/REST/rxcui.json') {
+        final mode = request.url.queryParameters['search']!;
+        searchModes.add(mode);
+        return jsonResponse({
+          'idGroup': {
+            'rxnormId': mode == '2' ? ['123'] : <String>[],
+          },
+        });
+      }
+      if (request.url.path == '/REST/rxcui/123/related.json') {
+        return jsonResponse({
+          'relatedGroup': {
+            'conceptGroup': [
+              {
+                'tty': 'IN',
+                'conceptProperties': [
+                  {'name': 'acetaminophen'},
+                ],
+              },
+            ],
+          },
+        });
+      }
+      return jsonResponse({}, statusCode: 404);
+    });
+
+    final result = await RxNavService.lookupGeneric('Tylenol', client: client);
+
+    expect(searchModes, ['1', '2']);
+    expect(result.genericName, 'Acetaminophen');
+    expect(result.requiresMatchConfirmation, isFalse);
+  });
+
+  test(
+    'approximate matching prefers a named RxNorm candidate at best rank',
+    () async {
+      final client = MockClient((request) async {
+        if (request.url.path == '/REST/rxcui.json') {
+          return jsonResponse({
+            'idGroup': {'rxnormId': <String>[]},
+          });
+        }
+        if (request.url.path == '/REST/approximateTerm.json') {
+          return jsonResponse({
+            'approximateGroup': {
+              'candidate': [
+                {'rxcui': 'wrong', 'rank': '1', 'source': 'MMSL'},
+                {
+                  'rxcui': '196503',
+                  'rank': '1',
+                  'source': 'RXNORM',
+                  'name': 'Zocor',
+                },
+              ],
+            },
+          });
+        }
+        if (request.url.path == '/REST/rxcui/196503/related.json') {
+          return jsonResponse({
+            'relatedGroup': {
+              'conceptGroup': [
+                {
+                  'tty': 'IN',
+                  'conceptProperties': [
+                    {'name': 'simvastatin'},
+                  ],
+                },
+              ],
+            },
+          });
+        }
+        return jsonResponse({}, statusCode: 404);
+      });
+
+      final result = await RxNavService.lookupGeneric('Zocorr', client: client);
+
+      expect(result.matchedMedicineName, 'Zocor');
+      expect(result.genericName, 'Simvastatin');
+    },
+  );
+
+  test(
+    'multiple-ingredient names are a fallback and empty results are safe',
+    () async {
+      var includeIngredient = true;
+      final client = MockClient((request) async {
+        if (request.url.path == '/REST/rxcui.json') {
+          return jsonResponse({
+            'idGroup': {
+              'rxnormId': ['456'],
+            },
+          });
+        }
+        if (request.url.path == '/REST/rxcui/456/related.json') {
+          return jsonResponse({
+            'relatedGroup': {
+              'conceptGroup': includeIngredient
+                  ? [
+                      {
+                        'tty': 'MIN',
+                        'conceptProperties': [
+                          {'name': 'amoxicillin / clavulanate'},
+                        ],
+                      },
+                    ]
+                  : <Object>[],
+            },
+          });
+        }
+        return jsonResponse({}, statusCode: 404);
+      });
+
+      final found = await RxNavService.lookupGeneric(
+        'Augmentin',
+        client: client,
+      );
+      includeIngredient = false;
+      final missing = await RxNavService.lookupGeneric(
+        'Augmentin',
+        client: client,
+      );
+
+      expect(found.genericName, 'Amoxicillin / Clavulanate');
+      expect(missing.outcome, RxNavLookupOutcome.notFound);
+    },
+  );
+
   test('service and malformed-response failures are recoverable', () async {
     final unavailable = MockClient(
       (_) async => jsonResponse({}, statusCode: 503),

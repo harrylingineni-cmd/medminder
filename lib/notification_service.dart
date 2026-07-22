@@ -471,7 +471,16 @@ class NotificationService {
         .resolvePlatformSpecificImplementation<
           AndroidFlutterLocalNotificationsPlugin
         >();
-    return await androidPlugin?.areNotificationsEnabled() ?? true;
+    if (androidPlugin != null) {
+      return await androidPlugin.areNotificationsEnabled() ?? false;
+    }
+
+    final iosPlugin = _plugin
+        .resolvePlatformSpecificImplementation<
+          IOSFlutterLocalNotificationsPlugin
+        >();
+    final iosPermissions = await iosPlugin?.checkPermissions();
+    return iosPermissions?.isEnabled ?? true;
   }
 
   /// Whether the app currently has permission to schedule *exact* alarms.
