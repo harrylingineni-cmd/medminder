@@ -53,6 +53,8 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
   // card doesn't change while the user is still typing their NEXT search.
   String _searchedBrand = '';
   String? _genericResult;
+  // The exact medicine name RxNav (or the India list) matched to. For an
+  // approximate US result, this is shown before the ingredient is revealed.
   String? _matchedMedicineName;
   var _requestGeneration = 0;
 
@@ -162,11 +164,15 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
     });
   }
 
-  void _confirmApproximateMatch() {
+  /// User tapped "Yes, this is my medicine" on the approximate-match
+  /// confirmation card — now it's safe to reveal the generic ingredient.
+  void _confirmMatchedMedicine() {
     setState(() => _status = _LookupStatus.found);
   }
 
-  void _rejectApproximateMatch() {
+  /// User tapped "No, search again" — go back to not-found rather than
+  /// showing a possibly-wrong generic ingredient.
+  void _rejectMatchedMedicine() {
     setState(() {
       _status = _LookupStatus.notFound;
       _genericResult = null;
@@ -366,6 +372,10 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
     }
   }
 
+  /// Shown only for an approximate US match, before the generic ingredient
+  /// is revealed. Large text and two big, clearly-labelled buttons — no
+  /// small print to misread, no default selected so a stray tap can't
+  /// accidentally confirm the wrong medicine.
   Widget _buildConfirmMatchCard() {
     return Container(
       margin: const EdgeInsets.only(top: 24),
@@ -378,41 +388,68 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          const Text(
-            'Check this possible match',
-            style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+          Row(
+            children: [
+              Icon(Icons.help_outline, color: Colors.orange.shade900, size: 28),
+              const SizedBox(width: 10),
+              const Expanded(
+                child: Text(
+                  'Is this your medicine?',
+                  style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+                ),
+              ),
+            ],
           ),
           const SizedBox(height: 12),
           const Text(
-            'RxNorm found a similar medicine name. Only continue if this name matches the label or package exactly. This lookup cannot confirm the strength, form, or dose:',
+            'We could not find an exact match for what you typed. This is '
+            'the closest medicine name we found. Only continue if this name '
+            'matches the label or package exactly. This lookup cannot confirm '
+            'the strength, form, or dose:',
             style: TextStyle(fontSize: 17, height: 1.4),
           ),
           const SizedBox(height: 14),
           _buildNameBlock(
-            label: 'Possible RxNorm match',
+            label: 'Closest match found',
             name: _matchedMedicineName ?? '',
-            icon: Icons.help_outline,
+            icon: Icons.medication_outlined,
           ),
-          const SizedBox(height: 16),
-          FilledButton(
-            onPressed: _confirmApproximateMatch,
-            style: FilledButton.styleFrom(
-              padding: const EdgeInsets.symmetric(vertical: 18),
-            ),
-            child: const Text(
-              'Yes, the name matches the label',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          const SizedBox(height: 18),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton(
+              onPressed: _confirmMatchedMedicine,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF1A4B8C),
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 20),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+              child: const Text(
+                'Yes, the name matches the label',
+                style: TextStyle(fontSize: 19, fontWeight: FontWeight.bold),
+              ),
             ),
           ),
-          const SizedBox(height: 8),
-          OutlinedButton(
-            onPressed: _rejectApproximateMatch,
-            style: OutlinedButton.styleFrom(
-              padding: const EdgeInsets.symmetric(vertical: 18),
-            ),
-            child: const Text(
-              'No, search again',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          const SizedBox(height: 12),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton(
+              onPressed: _rejectMatchedMedicine,
+              style: OutlinedButton.styleFrom(
+                foregroundColor: const Color(0xFF1A4B8C),
+                side: const BorderSide(color: Color(0xFF1A4B8C), width: 2),
+                padding: const EdgeInsets.symmetric(vertical: 20),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+              child: const Text(
+                'No, that is not it',
+                style: TextStyle(fontSize: 19, fontWeight: FontWeight.bold),
+              ),
             ),
           ),
         ],
@@ -436,7 +473,7 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
         children: [
           _buildNameBlock(
             label: _country == _Country.unitedStates
-                ? 'Medicine matched by RxNorm'
+                ? 'Medicine matched'
                 : 'Brand name you searched',
             name: _matchedMedicineName ?? _searchedBrand,
             icon: Icons.medication_outlined,

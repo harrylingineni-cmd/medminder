@@ -30,7 +30,7 @@ void main() {
     await tester.tap(find.widgetWithText(ElevatedButton, 'Search'));
     await tester.pumpAndSettle();
 
-    expect(find.text('Check this possible match'), findsOneWidget);
+    expect(find.text('Is this your medicine?'), findsOneWidget);
     expect(find.text('Simvastatin 10 MG Oral Tablet [Zocor]'), findsOneWidget);
     expect(find.text('Simvastatin'), findsNothing);
 

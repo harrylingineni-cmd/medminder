@@ -92,4 +92,44 @@ void main() {
 
     await tester.pumpWidget(const SizedBox.shrink());
   });
+
+  testWidgets('deleting a medication takes one confirmation', (tester) async {
+    SharedPreferences.setMockInitialValues({
+      'has_seen_welcome': true,
+      'medications': [
+        jsonEncode({
+          'id': 1000,
+          'name': 'Example',
+          'dosage': '10 mg',
+          'doseTimes': [
+            {'hour': 8, 'minute': 0},
+          ],
+          'reminderWindowMinutes': 30,
+        }),
+      ],
+    });
+    await tester.pumpWidget(const MedTrackerApp());
+    await tester.pumpAndSettle();
+
+    final deleteButton = find.byIcon(Icons.delete_outline);
+    await tester.ensureVisible(deleteButton);
+    await tester.tap(deleteButton);
+    await tester.pumpAndSettle();
+
+    expect(find.text('Delete this medication?'), findsOneWidget);
+    await tester.tap(find.widgetWithText(ElevatedButton, 'Delete'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Delete this medication?'), findsNothing);
+    expect(find.text('Delete medication?'), findsNothing);
+    expect(find.text('Example'), findsNothing);
+    expect(
+      SharedPreferences.getInstance().then(
+        (prefs) => prefs.getStringList('medications'),
+      ),
+      completion(isEmpty),
+    );
+
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
 }
