@@ -17,54 +17,136 @@
 //     shown on the Find Generic screen.
 const Map<String, String> indiaBrandToGeneric = {
   // ── Pain relief / fever ──
-  'Crocin': 'Paracetamol',
-  'Dolo': 'Paracetamol',
+  'Brufen': 'Ibuprofen',
   'Calpol': 'Paracetamol',
   'Combiflam': 'Ibuprofen + Paracetamol',
-  'Brufen': 'Ibuprofen',
-  'Ecosprin': 'Aspirin (low dose)',
+  'Crocin': 'Paracetamol',
   'Disprin': 'Aspirin',
+  'Dolo': 'Paracetamol',
+  'Ecosprin': 'Aspirin (low dose)',
+  'Etova': 'Etoricoxib',
+  'Hifenac': 'Aceclofenac',
+  'Meftal': 'Mefenamic acid',
+  'Naprosyn': 'Naproxen',
+  'Nise': 'Nimesulide',
+  'Tramazac': 'Tramadol',
+  'Ultracet': 'Tramadol + Paracetamol',
+  'Voveran': 'Diclofenac',
+  'Zerodol': 'Aceclofenac',
 
   // ── Diabetes ──
-  'Glycomet': 'Metformin',
-  'Januvia': 'Sitagliptin',
+  'Amaryl': 'Glimepiride',
+  'Galvus': 'Vildagliptin',
   'Glimestar': 'Glimepiride',
+  'Glycomet': 'Metformin',
+  'Jardiance': 'Empagliflozin',
+  'Januvia': 'Sitagliptin',
 
   // ── Antibiotics ──
   'Augmentin': 'Amoxicillin + Clavulanic acid',
-  'Azithral': 'Azithromycin',
   'Azee': 'Azithromycin',
-  'Zifi': 'Cefixime',
-  'Metrogyl': 'Metronidazole',
+  'Azithral': 'Azithromycin',
   'Cifran': 'Ciprofloxacin',
+  'Ciplox': 'Ciprofloxacin',
+  'Doxy-1': 'Doxycycline',
+  'Flagyl': 'Metronidazole',
+  'Levoflox': 'Levofloxacin',
+  'Metrogyl': 'Metronidazole',
+  'Monocef': 'Ceftriaxone',
+  'Mox': 'Amoxicillin',
+  'Novamox': 'Amoxicillin',
+  'Taxim-O': 'Cefixime',
+  'Zifi': 'Cefixime',
 
   // ── Stomach / acidity ──
+  'Nexpro': 'Esomeprazole',
+  'Omez': 'Omeprazole',
   'Pan': 'Pantoprazole',
   'Pantop': 'Pantoprazole',
-  'Omez': 'Omeprazole',
+  'Razo': 'Rabeprazole',
+  'Sompraz': 'Esomeprazole',
+
+  // ── Stomach cramps (antispasmodic) ──
+  'Buscopan': 'Hyoscine butylbromide',
+  'Cyclopam': 'Dicyclomine + Paracetamol',
+
+  // ── Nausea / vomiting ──
+  'Domstal': 'Domperidone',
+  'Emeset': 'Ondansetron',
+  'Ondem': 'Ondansetron',
+  'Perinorm': 'Metoclopramide',
+
+  // ── Constipation (laxatives / fibre) ──
+  'Duphalac': 'Lactulose',
+  'Isabgol': 'Psyllium husk',
 
   // ── Blood pressure / heart ──
-  'Telma': 'Telmisartan',
-  'Amlong': 'Amlodipine',
   'Amlokind': 'Amlodipine',
+  'Amlong': 'Amlodipine',
+  'Ciplar': 'Propranolol',
+  'Concor': 'Bisoprolol',
+  'Dytor': 'Torsemide',
+  'Envas': 'Enalapril',
+  'Lasix': 'Furosemide',
+  'Losar': 'Losartan',
   'Metolar': 'Metoprolol',
+  'Stamlo': 'Amlodipine',
+  'Telma': 'Telmisartan',
+
+  // ── Blood thinners ──
+  'Clopilet': 'Clopidogrel',
+  'Deplatt': 'Clopidogrel',
 
   // ── Cholesterol ──
-  'Storvas': 'Atorvastatin',
   'Atorva': 'Atorvastatin',
+  'Crestor': 'Rosuvastatin',
   'Rosuvas': 'Rosuvastatin',
+  'Storvas': 'Atorvastatin',
 
   // ── Thyroid ──
-  'Thyronorm': 'Levothyroxine',
   'Eltroxin': 'Levothyroxine',
+  'Thyronorm': 'Levothyroxine',
 
   // ── Allergy ──
+  'Alerid': 'Cetirizine',
   'Allegra': 'Fexofenadine',
-  'Montek': 'Montelukast',
+  'Avil': 'Pheniramine',
   'Cetzine': 'Cetirizine',
+  'Montek': 'Montelukast',
+
+  // ── Asthma / breathing ──
+  'Asthalin': 'Salbutamol',
+  'Budecort': 'Budesonide',
+  'Foracort': 'Formoterol + Budesonide',
+  'Seroflo': 'Salmeterol + Fluticasone',
+
+  // ── Mental health / sleep ──
+  'Alprax': 'Alprazolam',
+  'Clonotril': 'Clonazepam',
+  'Nexito': 'Escitalopram',
+  'Prodep': 'Fluoxetine',
+  'Restyl': 'Alprazolam',
+  'Zolfresh': 'Zolpidem',
+
+  // ── Nerve pain / seizures ──
+  'Encorate': 'Valproate',
+  'Eptoin': 'Phenytoin',
+  'Gabapin': 'Gabapentin',
+  'Levera': 'Levetiracetam',
+  'Pregabid': 'Pregabalin',
 
   // ── Supplements ──
+  'Becosules': 'Vitamin B complex + C',
+  'Evion': 'Vitamin E',
+  'Folvite': 'Folic acid',
+  'Limcee': 'Vitamin C',
+  'Neurobion': 'Vitamin B complex',
   'Shelcal': 'Calcium + Vitamin D3',
+
+  // ── Skin ──
+  'Betnovate': 'Betamethasone',
+  'Candid': 'Clotrimazole',
+  'Soframycin': 'Framycetin',
 };
 
 /// Looks up the generic name for [brandName] in the India list.
