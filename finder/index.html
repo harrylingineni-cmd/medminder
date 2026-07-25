@@ -1,0 +1,353 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MediGuard · Generic Medicine Finder</title>
+<meta name="description" content="Find the affordable generic version of a brand-name medicine. Same active ingredient, lower price.">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+
+  :root{
+    --bg:#F4EFE6;
+    --surface:#FFFFFF;
+    --ink:#21302C;
+    --ink-soft:#5E6D67;
+    --teal:#1F6F5C;
+    --teal-deep:#123F35;
+    --teal-tint:#E4F0EB;
+    --amber:#DC8A33;
+    --amber-tint:#FBEFDD;
+    --coral:#CD4F44;
+    --coral-tint:#FBE4E1;
+    --line:#E7DFD0;
+    --shadow:0 12px 34px rgba(18,63,53,.10);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    font-family:'Plus Jakarta Sans',system-ui,-apple-system,sans-serif;
+    background:radial-gradient(1100px 480px at 50% -8%, #F9F5EC, transparent), var(--bg);
+    color:var(--ink);min-height:100vh;padding:26px 18px 60px;line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:660px;margin:0 auto}
+
+  .brand{display:flex;align-items:center;gap:10px;justify-content:center}
+  .brand .dot{width:12px;height:12px;border-radius:50%;background:var(--amber)}
+  .brand .name{font-family:'Fraunces',serif;font-weight:600;font-size:25px;color:var(--teal-deep)}
+  .brand .tag{font-size:12px;font-weight:700;letter-spacing:1.4px;text-transform:uppercase;color:var(--teal);background:var(--teal-tint);padding:5px 11px;border-radius:99px}
+
+  h1{text-align:center;font-family:'Fraunces',serif;font-weight:600;font-size:31px;line-height:1.15;margin-top:16px;letter-spacing:-.3px}
+  .sub{text-align:center;color:var(--ink-soft);font-size:16.5px;margin:9px auto 0;max-width:470px}
+
+  .country{display:flex;gap:8px;justify-content:center;margin:24px 0 16px}
+  .country button{
+    font-family:inherit;font-size:15px;font-weight:700;cursor:pointer;
+    border:1.5px solid var(--line);background:var(--surface);color:var(--ink-soft);
+    padding:11px 22px;border-radius:99px;transition:.15s;
+  }
+  .country button.active{background:var(--teal);border-color:var(--teal);color:#fff}
+  .country button:active{transform:scale(.97)}
+
+  .search{display:flex;align-items:center;gap:12px;background:var(--surface);border:1.5px solid var(--line);border-radius:20px;padding:16px 18px;box-shadow:var(--shadow)}
+  .search input{border:none;outline:none;font-family:inherit;font-size:18px;flex:1;color:var(--ink);background:transparent;min-width:0}
+  .search input::placeholder{color:#A7AFA9}
+  .search button{
+    border:none;background:var(--teal);color:#fff;font-family:inherit;font-weight:800;font-size:15px;
+    padding:11px 20px;border-radius:13px;cursor:pointer;flex-shrink:0;
+  }
+  .search button:active{transform:scale(.97)}
+
+  .hint{text-align:center;color:var(--ink-soft);font-size:13.5px;margin-top:13px}
+  .hint b{color:var(--teal-deep);cursor:pointer;font-weight:700}
+  .hint b:hover{text-decoration:underline}
+
+  .state{margin-top:22px}
+  .loading,.empty,.error{text-align:center;color:var(--ink-soft);padding:24px 10px;font-size:16px;line-height:1.6}
+  .error{color:var(--coral)}
+
+  .result{display:none}
+  .result.show{display:block;animation:rise .28s ease}
+  @keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:24px;padding:22px;box-shadow:var(--shadow);margin-top:20px}
+
+  .swap-grid{display:grid;grid-template-columns:1fr auto 1fr;gap:14px;align-items:stretch}
+  @media(max-width:540px){
+    .swap-grid{grid-template-columns:1fr;gap:10px}
+    .arrow-cell{transform:rotate(90deg)}
+  }
+  .side{border-radius:18px;padding:18px 16px;display:flex;flex-direction:column;justify-content:center}
+  .side .role{font-size:11px;font-weight:800;letter-spacing:1.3px;text-transform:uppercase;margin-bottom:8px}
+  .side .drug{font-size:22px;font-weight:800;line-height:1.18;letter-spacing:-.3px}
+  .side .meta{font-size:13.5px;margin-top:6px;font-weight:600}
+  .brand-side{background:var(--coral-tint);border:1px solid #F1CFC9}
+  .brand-side .role{color:var(--coral)}
+  .generic-side{background:var(--teal-tint);border:1px solid #C9E2D8}
+  .generic-side .role{color:var(--teal)}
+  .generic-side .meta{color:var(--teal-deep)}
+  .arrow-cell{display:flex;align-items:center;justify-content:center;color:var(--teal);font-weight:800;font-size:26px}
+
+  .explain{margin-top:16px;font-size:15px;line-height:1.6;background:var(--amber-tint);border:1px solid #EFD9B4;border-radius:14px;padding:14px 16px}
+  .explain b{color:var(--teal-deep)}
+  .savings{margin-top:13px;text-align:center;background:var(--teal);color:#fff;border-radius:14px;padding:12px;font-weight:800;font-size:15px}
+
+  /* confirm step */
+  .confirm{background:var(--surface);border:2px solid var(--amber);border-radius:22px;padding:22px;box-shadow:var(--shadow);margin-top:20px;text-align:center}
+  .confirm h3{font-size:19px;margin-bottom:8px;color:var(--ink)}
+  .confirm .matched{font-size:24px;font-weight:800;color:var(--teal-deep);margin:12px 0;line-height:1.2}
+  .confirm p{font-size:15px;color:var(--ink-soft);line-height:1.55}
+  .confirm .btns{display:flex;gap:10px;margin-top:18px;flex-wrap:wrap;justify-content:center}
+  .confirm button{font-family:inherit;font-size:15.5px;font-weight:800;padding:13px 20px;border-radius:13px;cursor:pointer;border:none}
+  .btn-yes{background:var(--teal);color:#fff}
+  .btn-no{background:#fff;color:var(--ink-soft);border:1.5px solid var(--line)}
+
+  .disclaimer{margin-top:26px;font-size:13px;color:var(--ink-soft);line-height:1.65;border-top:1px solid var(--line);padding-top:16px;text-align:center}
+  .disclaimer b{color:var(--ink)}
+  footer{text-align:center;margin-top:20px;color:#A7AFA9;font-size:12.5px;line-height:1.7}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="brand">
+    <span class="dot"></span><span class="name">MediGuard</span><span class="tag">Generic Finder</span>
+  </div>
+
+  <h1>Find the affordable version of a medicine</h1>
+  <p class="sub">Enter a brand name to see its generic equivalent — the same active ingredient, usually at a much lower price.</p>
+
+  <div class="country">
+    <button id="btn-in" class="active" onclick="setCountry('IN')">🇮🇳 India</button>
+    <button id="btn-us" onclick="setCountry('US')">🇺🇸 United States</button>
+  </div>
+
+  <div class="search">
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" style="flex-shrink:0"><circle cx="11" cy="11" r="7" stroke="#1F6F5C" stroke-width="2.2"/><path d="M20 20l-3.2-3.2" stroke="#1F6F5C" stroke-width="2.2" stroke-linecap="round"/></svg>
+    <input id="q" placeholder="Type a medicine name" autocomplete="off" onkeydown="if(event.key==='Enter')lookup()">
+    <button onclick="lookup()">Search</button>
+  </div>
+  <div class="hint" id="hint"></div>
+
+  <div class="state" id="state"></div>
+  <div class="result" id="result"></div>
+
+  <div class="disclaimer">
+    <b>For information only — this is not medical advice.</b><br>
+    A matching active ingredient does not by itself mean two products are interchangeable — strength, form and dosage can differ. Always confirm with your doctor or pharmacist before changing any medicine, and never stop a prescribed medicine on your own.
+  </div>
+
+  <footer>
+    MediGuard · helping people find affordable medicine<br>
+    India results come from a curated list of common brands. U.S. results come from the National Library of Medicine's RxNorm service.
+  </footer>
+</div>
+
+<script>
+  let country='IN', reqId=0;
+
+  /* ── CORS proxy handling ──────────────────────────────────────────────────
+     RxNav blocks direct browser requests (CORS), so web pages must route
+     through a proxy. The first entry is our own Cloudflare Worker, which is
+     free, reliable, and restricted to only fetch from rxnav.nlm.nih.gov.
+     The public proxies below are fallbacks in case the Worker is ever down. */
+  const PROXIES = [
+    u => `https://mediguard-proxy.harrylingineni.workers.dev/?url=${encodeURIComponent(u)}`,
+    u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+    u => `https://corsproxy.io/?${encodeURIComponent(u)}`
+  ];
+
+  async function fetchJson(url){
+    let lastErr;
+    for(const wrap of PROXIES){
+      try{
+        const res = await fetch(wrap(url), {headers:{'Accept':'application/json'}});
+        if(!res.ok){ lastErr = new Error('HTTP '+res.status); continue; }
+        const text = await res.text();
+        try{ return JSON.parse(text); }
+        catch(e){ lastErr = e; continue; }
+      }catch(e){ lastErr = e; }
+    }
+    throw lastErr || new Error('All proxies failed');
+  }
+
+  /* ── INDIA: curated list (mirrors the MediGuard app) ─────────────────────── */
+  const INDIA={
+    'alerid':'Cetirizine','allegra':'Fexofenadine','alprax':'Alprazolam','amaryl':'Glimepiride',
+    'amlokind':'Amlodipine','amlong':'Amlodipine','asthalin':'Salbutamol','atorva':'Atorvastatin',
+    'augmentin':'Amoxicillin + Clavulanic acid','avil':'Pheniramine','azee':'Azithromycin',
+    'azithral':'Azithromycin','becosules':'Vitamin B complex + C','betnovate':'Betamethasone',
+    'brufen':'Ibuprofen','budecort':'Budesonide','buscopan':'Hyoscine butylbromide',
+    'calpol':'Paracetamol','candid':'Clotrimazole','cetzine':'Cetirizine','cifran':'Ciprofloxacin',
+    'ciplar':'Propranolol','ciplox':'Ciprofloxacin','clonotril':'Clonazepam','clopilet':'Clopidogrel',
+    'combiflam':'Ibuprofen + Paracetamol','concor':'Bisoprolol','crestor':'Rosuvastatin',
+    'crocin':'Paracetamol','cyclopam':'Dicyclomine + Paracetamol','deplatt':'Clopidogrel',
+    'dolo':'Paracetamol','domstal':'Domperidone','doxy-1':'Doxycycline','duphalac':'Lactulose',
+    'dytor':'Torsemide','ecosprin':'Aspirin (low dose)','eltroxin':'Levothyroxine',
+    'emeset':'Ondansetron','encorate':'Valproate','envas':'Enalapril','eptoin':'Phenytoin',
+    'etova':'Etoricoxib','evion':'Vitamin E','flagyl':'Metronidazole','folvite':'Folic acid',
+    'foracort':'Formoterol + Budesonide','gabapin':'Gabapentin','galvus':'Vildagliptin',
+    'glimestar':'Glimepiride','glucophage':'Metformin','glycomet':'Metformin','hifenac':'Aceclofenac',
+    'isabgol':'Psyllium husk','januvia':'Sitagliptin','jardiance':'Empagliflozin','lasix':'Furosemide',
+    'levera':'Levetiracetam','levoflox':'Levofloxacin','limcee':'Vitamin C','losar':'Losartan',
+    'meftal':'Mefenamic acid','metolar':'Metoprolol','metrogyl':'Metronidazole','monocef':'Ceftriaxone',
+    'montek':'Montelukast','mox':'Amoxicillin','naprosyn':'Naproxen','neurobion':'Vitamin B complex',
+    'nexito':'Escitalopram','nexpro':'Esomeprazole','nise':'Nimesulide','novamox':'Amoxicillin',
+    'omez':'Omeprazole','ondem':'Ondansetron','pan':'Pantoprazole','pantop':'Pantoprazole',
+    'perinorm':'Metoclopramide','pregabid':'Pregabalin','prodep':'Fluoxetine','razo':'Rabeprazole',
+    'restyl':'Alprazolam','rosuvas':'Rosuvastatin','seroflo':'Salmeterol + Fluticasone',
+    'shelcal':'Calcium + Vitamin D3','soframycin':'Framycetin','sompraz':'Esomeprazole',
+    'stamlo':'Amlodipine','storvas':'Atorvastatin','taxim-o':'Cefixime','telma':'Telmisartan',
+    'thyronorm':'Levothyroxine','tramazac':'Tramadol','ultracet':'Tramadol + Paracetamol',
+    'voveran':'Diclofenac','zerodol':'Aceclofenac','zifi':'Cefixime','zolfresh':'Zolpidem'
+  };
+
+  const EX={
+    IN:['Crocin','Zerodol','Telma','Shelcal'],
+    US:['Tylenol','Advil','Lipitor','Prilosec']
+  };
+
+  function setCountry(c){
+    country=c;
+    document.getElementById('btn-in').classList.toggle('active',c==='IN');
+    document.getElementById('btn-us').classList.toggle('active',c==='US');
+    document.getElementById('q').placeholder = c==='IN' ? 'Type a medicine name (e.g. Crocin)' : 'Type a medicine name (e.g. Tylenol)';
+    renderHint(); clear();
+  }
+  function renderHint(){
+    document.getElementById('hint').innerHTML =
+      'Try: ' + EX[country].map(n=>`<b onclick="demo('${n}')">${n}</b>`).join(' · ');
+  }
+  function demo(n){ document.getElementById('q').value=n; lookup(); }
+
+  function clear(){
+    document.getElementById('result').classList.remove('show');
+    document.getElementById('result').innerHTML='';
+    document.getElementById('state').innerHTML='';
+  }
+  function setState(h){ document.getElementById('state').innerHTML=h; }
+
+  function showResult(brand,generic,note){
+    document.getElementById('state').innerHTML='';
+    const r=document.getElementById('result');
+    r.innerHTML=`
+      <div class="card">
+        <div class="swap-grid">
+          <div class="side brand-side">
+            <div class="role">You searched</div>
+            <div class="drug">${esc(brand)}</div>
+          </div>
+          <div class="arrow-cell">→</div>
+          <div class="side generic-side">
+            <div class="role">Generic — ask for this</div>
+            <div class="drug">${esc(generic)}</div>
+            <div class="meta">Same active ingredient</div>
+          </div>
+        </div>
+        <div class="explain">
+          <b>${esc(brand)}</b> contains <b>${esc(generic)}</b>. A generic has the same active ingredient, so it works the same way in your body — but it usually costs much less.
+        </div>
+        <div class="savings">💰 Ask your pharmacist about the generic</div>
+        ${note?`<div style="margin-top:12px;font-size:13.5px;color:var(--ink-soft);text-align:center">${esc(note)}</div>`:''}
+      </div>`;
+    r.classList.add('show');
+  }
+
+  function showConfirm(typed, matched, rxcui, myReq){
+    document.getElementById('state').innerHTML='';
+    const r=document.getElementById('result');
+    r.innerHTML=`
+      <div class="confirm">
+        <h3>Please check this match</h3>
+        <p>We couldn't find an exact match for “${esc(typed)}”. The closest medicine we found is:</p>
+        <div class="matched">${esc(matched)}</div>
+        <p>Does this match the name printed on your medicine packet?</p>
+        <div class="btns">
+          <button class="btn-yes" onclick="confirmMatch('${esc(matched)}',${rxcui},${myReq})">Yes, that matches</button>
+          <button class="btn-no" onclick="clear()">No, that's different</button>
+        </div>
+      </div>`;
+    r.classList.add('show');
+  }
+
+  async function confirmMatch(matched, rxcui, myReq){
+    clear();
+    setState('<div class="loading">Looking up the generic ingredient…</div>');
+    const ing = await getIngredients(rxcui);
+    if(reqId!==myReq) return;
+    if(!ing){ setState(`<div class="empty">We found <b>${esc(matched)}</b> but couldn't determine its generic ingredient. Please ask your pharmacist.</div>`); return; }
+    showResult(matched, ing);
+  }
+
+  /* ── US lookup: exact match first, then approximate w/ confirmation ─────── */
+  async function getIngredients(rxcui){
+    try{
+      const data = await fetchJson(`https://rxnav.nlm.nih.gov/REST/rxcui/${rxcui}/related.json?tty=IN`);
+      const groups = data?.relatedGroup?.conceptGroup || [];
+      let names=[];
+      groups.forEach(g=>(g.conceptProperties||[]).forEach(c=>names.push(c.name)));
+      names=[...new Set(names)];
+      if(!names.length) return null;
+      return names.map(titleCase).join(' + ');
+    }catch(e){ return null; }
+  }
+
+  async function lookup(){
+    const typed=document.getElementById('q').value.trim();
+    clear();
+    if(!typed) return;
+    const myReq=++reqId;
+
+    if(country==='IN'){
+      const hit=INDIA[typed.toLowerCase()];
+      if(hit) showResult(titleCase(typed), hit);
+      else setState(`<div class="empty">We don't have <b>${esc(typed)}</b> in our India list yet.<br>Try one of the examples above, or check the spelling on the packet.</div>`);
+      return;
+    }
+
+    setState('<div class="loading">Searching the U.S. medicine database…</div>');
+    try{
+      // 1) exact match
+      const exactData = await fetchJson(`https://rxnav.nlm.nih.gov/REST/rxcui.json?name=${encodeURIComponent(typed)}&search=2`);
+      if(reqId!==myReq) return;
+      const exactId = exactData?.idGroup?.rxnormId?.[0];
+
+      if(exactId){
+        const ing = await getIngredients(exactId);
+        if(reqId!==myReq) return;
+        if(ing){ showResult(titleCase(typed), ing); return; }
+      }
+
+      // 2) approximate — ask user to confirm before showing a generic
+      const apxData = await fetchJson(`https://rxnav.nlm.nih.gov/REST/approximateTerm.json?term=${encodeURIComponent(typed)}&maxEntries=1`);
+      if(reqId!==myReq) return;
+      const cand = apxData?.approximateGroup?.candidate?.[0];
+      if(!cand){ setState(`<div class="empty">No match found for <b>${esc(typed)}</b>.<br>Check the spelling on the packet and try again.</div>`); return; }
+
+      // get a readable name for the candidate
+      let name = cand.name;
+      if(!name){
+        try{
+          const pd = await fetchJson(`https://rxnav.nlm.nih.gov/REST/rxcui/${cand.rxcui}/property.json?propName=RxNorm%20Name`);
+          name = pd?.propConceptGroup?.propConcept?.[0]?.propValue || typed;
+        }catch(e){ name = typed; }
+      }
+      if(reqId!==myReq) return;
+      showConfirm(typed, titleCase(name), cand.rxcui, myReq);
+
+    }catch(err){
+      if(reqId!==myReq) return;
+      setState('<div class="error">Couldn\'t reach the U.S. medicine database right now.<br>Please try again in a moment — or use the MediGuard Android app, which connects directly.</div>');
+    }
+  }
+
+  function titleCase(s){
+    return String(s).split(' ').map(w=> w.length>2 ? w.charAt(0).toUpperCase()+w.slice(1).toLowerCase() : w).join(' ');
+  }
+  function esc(s){ return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+  renderHint();
+</script>
+</body>
+</html>
