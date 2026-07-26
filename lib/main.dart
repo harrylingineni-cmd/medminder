@@ -483,10 +483,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   ///     just re-confirms what should already be pending).
   ///   - If it has already been taken today, the chain is anchored to
   ///     *tomorrow's* scheduled time instead, ready for the next day.
-  ///   - If the user is currently within an active snooze for this dose, we
-  ///     don't touch its chain at all — it was already cancelled when they
-  ///     snoozed (see `_snooze`), and there's nothing useful to schedule
-  ///     until the snooze itself fires or the day rolls over.
+  ///   - If the user is currently within an active snooze for this dose — or
+  ///     within that snooze's own repeat-until-confirmed window, which
+  ///     `_snooze` schedules separately — we don't touch its chain at all.
+  ///     `_snooze` already scheduled everything that dose needs; recomputing
+  ///     an anchor from `medication.doseTimes` here would overwrite those
+  ///     snooze-anchored reminders with wrongly-timed ones.
   Future<void> _scheduleReminderChainForDose(
     Medication medication,
     int doseIndex,
@@ -499,7 +501,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final snoozeUntil = DateTime.fromMillisecondsSinceEpoch(
         snoozeUntilMillis,
       );
-      if (now.isBefore(snoozeUntil)) return; // Currently snoozed — skip.
+      final snoozeSeriesEnds = snoozeUntil.add(
+        Duration(minutes: medication.reminderWindowMinutes),
+      );
+      if (now.isBefore(snoozeSeriesEnds)) return; // Snooze series active.
     }
 
     final doseTime = medication.doseTimes[doseIndex];
@@ -587,11 +592,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _recomputeDue();
   }
 
-  /// "Remind me in 10 minutes" for one dose — hides that dose's due card
-  /// for now, cancels its repeat-until-confirmed chain (snoozing counts as
-  /// "dealt with" for now, so the every-5-minutes pings for this dose
-  /// should stop), and schedules a one-time reminder notification 10
-  /// minutes from now, just for this dose.
+  /// "Remind me in 10 minutes" for one dose — hides that dose's due card for
+  /// now, cancels whatever repeat-until-confirmed chain was already running
+  /// for it, and schedules a one-time reminder notification 10 minutes from
+  /// now, just for this dose.
+  ///
+  /// Snoozing is only a pause, not a stop: if the user doesn't confirm the
+  /// 10-minute reminder either, the same every-5-minutes "please confirm"
+  /// chain used for a normal due dose resumes right after it, for the rest
+  /// of the medication's usual reminder window — just anchored to
+  /// `snoozeUntil` instead of the dose's original scheduled time. It reuses
+  /// `scheduleRepeatReminders` and this dose's normal repeat-reminder ids, so
+  /// `_markTaken`'s existing `cancelRepeatReminders(doseId)` call already
+  /// cancels this too — no separate cleanup path needed.
   Future<void> _snooze(Medication medication, int doseIndex) async {
     final snoozeUntil = DateTime.now().add(const Duration(minutes: 10));
     await DueStatusStorage.snooze(medication.id, doseIndex, snoozeUntil);
@@ -605,6 +618,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       medicationName: medication.name,
       dosage: medication.dosage,
       fireAt: snoozeUntil,
+    );
+    await NotificationService.instance.scheduleRepeatReminders(
+      id: doseId,
+      medicationName: medication.name,
+      dosage: medication.dosage,
+      anchorTime: snoozeUntil,
+      reminderWindowMinutes: medication.reminderWindowMinutes,
     );
     _dueStatus = await DueStatusStorage.loadAll();
     _recomputeDue();
