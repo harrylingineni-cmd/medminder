@@ -574,13 +574,29 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     setState(() => _dueDoses = due);
   }
 
-  /// "I've taken it" for one dose — marks just that dose as done for today,
-  /// cancels its pending snooze reminder AND its whole repeat-until-
-  /// confirmed chain (so it stops pinging every 5 minutes), and removes its
-  /// due card. Every other dose (of this medication or any other) is
-  /// completely unaffected.
+  /// "I've taken it" for one dose — marks just that dose as done, cancels
+  /// its pending snooze reminder AND its whole repeat-until-confirmed chain
+  /// (so it stops pinging every 5 minutes), and removes its due card. Every
+  /// other dose (of this medication or any other) is completely unaffected.
+  ///
+  /// Records the taken date against whichever occurrence is currently due
+  /// (see `currentDoseOccurrence` in due_status_storage.dart) rather than
+  /// always "today" — otherwise confirming a late-night dose shortly after
+  /// midnight would stamp it with the new day's date, and `isMedicationDue`
+  /// would briefly show it as due again until yesterday's window elapsed.
   Future<void> _markTaken(Medication medication, int doseIndex) async {
-    await DueStatusStorage.markTakenToday(medication.id, doseIndex);
+    final doseTime = medication.doseTimes[doseIndex];
+    final occurrence = currentDoseOccurrence(
+      hour: doseTime.hour,
+      minute: doseTime.minute,
+      reminderWindowMinutes: medication.reminderWindowMinutes,
+      now: DateTime.now(),
+    );
+    await DueStatusStorage.markTakenToday(
+      medication.id,
+      doseIndex,
+      when: occurrence,
+    );
     final doseId = NotificationService.doseNotificationBaseId(
       medication.id,
       doseIndex,

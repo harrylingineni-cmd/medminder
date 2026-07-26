@@ -97,15 +97,25 @@ class DueStatusStorage {
     }
   }
 
-  /// Record that dose [doseIndex] of [medicationId] was taken today. This
-  /// clears any snooze on that specific dose, since it's now been dealt
-  /// with. Other doses of the same medication are untouched.
-  static Future<void> markTakenToday(int medicationId, int doseIndex) async {
+  /// Record that dose [doseIndex] of [medicationId] was taken. This clears
+  /// any snooze on that specific dose, since it's now been dealt with.
+  /// Other doses of the same medication are untouched.
+  ///
+  /// [when] should be the date of the occurrence actually being confirmed
+  /// (see [currentDoseOccurrence]) — normally that's just today, but for a
+  /// late-night dose confirmed shortly after midnight it's last night's
+  /// date. Defaults to right now if omitted, which is correct for every
+  /// case except that one.
+  static Future<void> markTakenToday(
+    int medicationId,
+    int doseIndex, {
+    DateTime? when,
+  }) async {
     final all = await loadAll();
     all[(medicationId, doseIndex)] = DueStatusEntry(
       medicationId: medicationId,
       doseIndex: doseIndex,
-      takenDate: todayString(),
+      takenDate: todayString(when),
       snoozeUntilMillis: null,
     );
     await _saveAll(all);
@@ -152,16 +162,43 @@ class DueStatusStorage {
   }
 }
 
+/// Which scheduled occurrence of a dose (at [hour]:[minute]) should
+/// currently be treated as "the one in play" — or null if none should.
+///
+/// Normally that's today's occurrence. But if today's time hasn't arrived
+/// yet, it might still be YESTERDAY's occurrence, carried forward as long as
+/// [now] is within [reminderWindowMinutes] of it (e.g. it's 12:05 AM and the
+/// dose was due at 11:50 PM last night). Only once that window has also
+/// elapsed does this return null — meaning neither occurrence applies right
+/// now.
+///
+/// This is the one place that decides "which night does this moment belong
+/// to" for a dose. Both [isMedicationDue] and `_markTaken` in main.dart call
+/// it, so a dose confirmed just after midnight is always checked and
+/// recorded against the same occurrence — they can never disagree.
+DateTime? currentDoseOccurrence({
+  required int hour,
+  required int minute,
+  required int reminderWindowMinutes,
+  required DateTime now,
+}) {
+  final scheduledToday = DateTime(now.year, now.month, now.day, hour, minute);
+  if (!now.isBefore(scheduledToday)) return scheduledToday;
+
+  final scheduledYesterday = scheduledToday.subtract(const Duration(days: 1));
+  final yesterdayWindowEnd = scheduledYesterday.add(
+    Duration(minutes: reminderWindowMinutes),
+  );
+  return now.isBefore(yesterdayWindowEnd) ? scheduledYesterday : null;
+}
+
 /// The single rule for whether a dose counts as "due right now":
 ///
-/// 1. Its scheduled time today must have already arrived — OR, if it
-///    hasn't, YESTERDAY's occurrence of this same dose must still be within
-///    its reminder window. Without this, a late-night dose (e.g. 11:50 PM)
-///    would stop showing as due the instant the calendar date rolls over at
-///    midnight, even though it's still inside the window it's actively
-///    being notified for.
-/// 2. It must not already be marked taken for whichever occurrence applies
-///    — today's, or the one carried over from last night.
+/// 1. It must currently have an applicable occurrence at all — see
+///    [currentDoseOccurrence]. (This is what lets a late-night dose, e.g.
+///    11:50 PM, keep showing as due for a while after midnight, instead of
+///    resetting the instant the calendar date rolls over.)
+/// 2. It must not already be marked taken for that occurrence.
 /// 3. It must not currently be within a snooze period.
 ///
 /// All three must hold for the dose to show up as due. This is checked
@@ -175,27 +212,14 @@ bool isMedicationDue({
   required DueStatusEntry? status,
   required DateTime now,
 }) {
-  final scheduledToday = DateTime(now.year, now.month, now.day, hour, minute);
-
-  final DateTime scheduledOccurrence;
-  if (now.isBefore(scheduledToday)) {
-    // Today's time hasn't arrived yet — but we might still be inside
-    // yesterday's reminder window (e.g. it's 12:05 AM and the dose was due
-    // at 11:50 PM last night). Carry that occurrence forward instead of
-    // treating this dose as simply "not due" until tonight.
-    final scheduledYesterday = scheduledToday.subtract(
-      const Duration(days: 1),
-    );
-    final yesterdayWindowEnd = scheduledYesterday.add(
-      Duration(minutes: reminderWindowMinutes),
-    );
-    if (now.isBefore(yesterdayWindowEnd)) {
-      scheduledOccurrence = scheduledYesterday;
-    } else {
-      return false; // Today's dose isn't due yet, and yesterday's window is over.
-    }
-  } else {
-    scheduledOccurrence = scheduledToday;
+  final scheduledOccurrence = currentDoseOccurrence(
+    hour: hour,
+    minute: minute,
+    reminderWindowMinutes: reminderWindowMinutes,
+    now: now,
+  );
+  if (scheduledOccurrence == null) {
+    return false; // Not due yet today, and yesterday's window is over.
   }
 
   if (status?.takenDate == DueStatusStorage.todayString(scheduledOccurrence)) {
