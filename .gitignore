@@ -1,6 +1,7 @@
 .dart_tool/
 .packages
 build/
+coverage/
 .flutter-plugins
 .flutter-plugins-dependencies
 *.iml
@@ -18,3 +19,4 @@ ios/Pods/
 ios/.symlinks/
 .DS_Store
 *.log
+.cgstack/

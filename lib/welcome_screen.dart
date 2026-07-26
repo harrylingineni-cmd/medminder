@@ -157,10 +157,7 @@ class WelcomeScreen extends StatelessWidget {
                   child: InkWell(
                     onTap: () => _openPrivacyPolicy(context),
                     child: const Padding(
-                      padding: EdgeInsets.symmetric(
-                        vertical: 8,
-                        horizontal: 4,
-                      ),
+                      padding: EdgeInsets.symmetric(vertical: 8, horizontal: 4),
                       child: Text(
                         'Read our Privacy Policy',
                         style: TextStyle(

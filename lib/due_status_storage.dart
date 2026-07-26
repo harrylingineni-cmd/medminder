@@ -152,6 +152,25 @@ class DueStatusStorage {
     await _saveAll(all);
   }
 
+  /// Moves persisted dose state when an older medication id is migrated to
+  /// the compact notification-id range used by current releases.
+  static Future<void> remapMedicationIds(Map<int, int> replacements) async {
+    if (replacements.isEmpty) return;
+    final all = await loadAll();
+    final remapped = <DoseKey, DueStatusEntry>{};
+    for (final entry in all.values) {
+      final medicationId =
+          replacements[entry.medicationId] ?? entry.medicationId;
+      remapped[(medicationId, entry.doseIndex)] = DueStatusEntry(
+        medicationId: medicationId,
+        doseIndex: entry.doseIndex,
+        takenDate: entry.takenDate,
+        snoozeUntilMillis: entry.snoozeUntilMillis,
+      );
+    }
+    await _saveAll(remapped);
+  }
+
   /// Today's date as "yyyy-MM-dd", used to check/record `takenDate`.
   static String todayString([DateTime? when]) {
     final d = when ?? DateTime.now();
