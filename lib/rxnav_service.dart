@@ -125,6 +125,27 @@ class RxNavService {
     }
   }
 
+  /// GETs [uri] and returns its decoded JSON body.
+  ///
+  /// Throws if the request fails outright (no connection, timeout) OR if the
+  /// server responds with anything other than 200. That second case matters:
+  /// RxNav returns 200 with an empty result set for a genuine "no match", so
+  /// any non-200 here means something actually went wrong on the network or
+  /// server side (down, rate-limited, etc.) — not "this isn't a medicine".
+  /// Throwing lets that distinction survive all the way up to
+  /// `lookupGeneric`'s catch block, which turns it into
+  /// [RxNavLookupOutcome.networkError] instead of [RxNavLookupOutcome.notFound].
+  static Future<Map<String, dynamic>> _getJson(Uri uri) async {
+    final response = await http.get(uri).timeout(_timeout);
+    if (response.statusCode != 200) {
+      throw http.ClientException(
+        'RxNav returned HTTP ${response.statusCode}',
+        uri,
+      );
+    }
+    return jsonDecode(response.body) as Map<String, dynamic>;
+  }
+
   /// Step 1a (preferred): `https://rxnav.nlm.nih.gov/REST/rxcui.json`
   /// Looks for an EXACT match of [term] against RxNorm's medicine names.
   /// Tries `search=1` (exact string match) first, then `search=2`
@@ -141,10 +162,7 @@ class RxNavService {
         '$_baseUrl/rxcui.json'
         '?name=${Uri.encodeQueryComponent(term)}&search=$searchMode',
       );
-      final response = await http.get(uri).timeout(_timeout);
-      if (response.statusCode != 200) continue;
-
-      final body = jsonDecode(response.body) as Map<String, dynamic>;
+      final body = await _getJson(uri);
       final idGroup = body['idGroup'] as Map<String, dynamic>?;
       final ids = idGroup?['rxnormId'] as List?;
       if (ids != null && ids.isNotEmpty) return ids.first as String;
@@ -159,6 +177,13 @@ class RxNavService {
   /// doesn't return a name itself, only an id and a score. Returns null if
   /// nothing matched.
   ///
+  /// Asks for up to 5 candidates rather than just 1: approximateTerm.json can
+  /// return several candidates tied for the top rank, drawn from different
+  /// source vocabularies (not just RXNORM). Blindly taking whichever one the
+  /// API listed first risked landing on a non-RXNORM concept whose "related"
+  /// ingredient data doesn't line up the way ours expects. Among the
+  /// top-ranked candidates, we now prefer the one whose source is RXNORM.
+  ///
   /// Callers must treat the result as a candidate to confirm with the user,
   /// not a definite answer — see [RxNavLookupResult.isApproximateMatch].
   static Future<({String rxcui, String name})?> _findClosestRxcui(
@@ -166,25 +191,27 @@ class RxNavService {
   ) async {
     final searchUri = Uri.parse(
       '$_baseUrl/approximateTerm.json'
-      '?term=${Uri.encodeQueryComponent(term)}&maxEntries=1',
+      '?term=${Uri.encodeQueryComponent(term)}&maxEntries=5',
     );
-    final searchResponse = await http.get(searchUri).timeout(_timeout);
-    if (searchResponse.statusCode != 200) return null;
-
-    final searchBody = jsonDecode(searchResponse.body) as Map<String, dynamic>;
+    final searchBody = await _getJson(searchUri);
     final group = searchBody['approximateGroup'] as Map<String, dynamic>?;
     final candidates = group?['candidate'] as List?;
     if (candidates == null || candidates.isEmpty) return null;
 
-    final firstCandidate = candidates.first as Map<String, dynamic>;
-    final rxcui = firstCandidate['rxcui'] as String?;
-    if (rxcui == null) return null;
+    final parsedCandidates = candidates.cast<Map<String, dynamic>>();
+    final bestRank = parsedCandidates.first['rank'] as String?;
+    final tiedForBest = bestRank == null
+        ? parsedCandidates
+        : parsedCandidates.where((c) => c['rank'] == bestRank).toList();
+    final chosen = tiedForBest.firstWhere(
+      (c) => c['source'] == 'RXNORM',
+      orElse: () => tiedForBest.first,
+    );
+    final rxcui = chosen['rxcui'] as String?;
+    if (rxcui == null || rxcui.isEmpty) return null;
 
     final nameUri = Uri.parse('$_baseUrl/rxcui/$rxcui/properties.json');
-    final nameResponse = await http.get(nameUri).timeout(_timeout);
-    if (nameResponse.statusCode != 200) return null;
-
-    final nameBody = jsonDecode(nameResponse.body) as Map<String, dynamic>;
+    final nameBody = await _getJson(nameUri);
     final properties = nameBody['properties'] as Map<String, dynamic>?;
     final name = properties?['name'] as String?;
     if (name == null || name.trim().isEmpty) return null;
@@ -216,10 +243,7 @@ class RxNavService {
   /// the user searched for" behavior we want, with no extra logic needed.
   static Future<List<String>> _findIngredientNames(String rxcui) async {
     final uri = Uri.parse('$_baseUrl/rxcui/$rxcui/related.json?tty=IN+MIN');
-    final response = await http.get(uri).timeout(_timeout);
-    if (response.statusCode != 200) return const [];
-
-    final body = jsonDecode(response.body) as Map<String, dynamic>;
+    final body = await _getJson(uri);
     final group = body['relatedGroup'] as Map<String, dynamic>?;
     final conceptGroups = group?['conceptGroup'] as List?;
     if (conceptGroups == null) return const [];

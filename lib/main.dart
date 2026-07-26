@@ -562,6 +562,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         final isDue = isMedicationDue(
           hour: doseTime.hour,
           minute: doseTime.minute,
+          reminderWindowMinutes: medication.reminderWindowMinutes,
           status: _dueStatus[(medication.id, doseIndex)],
           now: now,
         );
