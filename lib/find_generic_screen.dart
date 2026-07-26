@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'generic_medicine_data.dart';
 import 'rxnav_service.dart';
 
@@ -17,6 +18,12 @@ import 'rxnav_service.dart';
 // This screen never suggests switching medicines on its own — it always
 // pairs the result with a disclaimer to confirm with a doctor/pharmacist
 // first (see `_buildDisclaimer` below).
+
+/// The companion website — the same India/US generic finder, usable from any
+/// phone or computer's browser without installing the app. Linked from a
+/// button at the bottom of this screen, never shown as raw text.
+const String _companionWebsiteUrl =
+    'https://harrylingineni-cmd.github.io/medminder/finder/';
 
 /// Which country's medicine names we're searching. India uses our local
 /// list; United States calls the live RxNav API.
@@ -166,6 +173,23 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
     }
   }
 
+  /// Opens the companion website in the phone's browser, mirroring how
+  /// `WelcomeScreen._openPrivacyPolicy` opens its link.
+  Future<void> _openWebsite() async {
+    final uri = Uri.parse(_companionWebsiteUrl);
+    final opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    if (!opened && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Could not open the website.',
+            style: TextStyle(fontSize: 18),
+          ),
+        ),
+      );
+    }
+  }
+
   // ── Build ────────────────────────────────────────────────────────────
 
   @override
@@ -203,6 +227,7 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
               _buildSuggestions(),
               _buildResultArea(),
               _buildDisclaimer(),
+              _buildWebsiteButton(),
             ],
           ),
         ),
@@ -697,6 +722,44 @@ class _FindGenericScreenState extends State<FindGenericScreen> {
           ),
         ],
       ),
+    );
+  }
+
+  /// A secondary action, styled below (and visually lighter than) the
+  /// primary blue Search button so it never competes with searching — links
+  /// out to the companion website version of this same finder. The URL
+  /// itself is never shown, only the button and a short caption.
+  Widget _buildWebsiteButton() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const SizedBox(height: 28),
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            onPressed: _openWebsite,
+            style: OutlinedButton.styleFrom(
+              foregroundColor: const Color(0xFF1A4B8C),
+              side: const BorderSide(color: Color(0xFF1A4B8C), width: 2),
+              padding: const EdgeInsets.symmetric(vertical: 18),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+            ),
+            icon: const Icon(Icons.public, size: 26),
+            label: const Text(
+              'Open Website',
+              style: TextStyle(fontSize: 19, fontWeight: FontWeight.bold),
+            ),
+          ),
+        ),
+        const SizedBox(height: 10),
+        const Text(
+          'Use the finder on any phone or computer.',
+          textAlign: TextAlign.center,
+          style: TextStyle(fontSize: 15, color: Colors.black54),
+        ),
+      ],
     );
   }
 }
