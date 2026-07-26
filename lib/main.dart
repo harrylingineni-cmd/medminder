@@ -1023,6 +1023,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       itemBuilder: (context, index) {
         return _MedicationCard(
           medication: _medications[index],
+          dueStatus: _dueStatus,
           onDelete: () => _confirmDeleteMedication(index),
           onTap: () => _editMedication(index),
         );
@@ -1039,13 +1040,42 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 class _MedicationCard extends StatelessWidget {
   const _MedicationCard({
     required this.medication,
+    required this.dueStatus,
     required this.onDelete,
     required this.onTap,
   });
 
   final Medication medication;
+
+  /// The same due/taken/snooze status map `HomeScreen` already loads and
+  /// keeps current — used here only to read whether each dose has already
+  /// been taken today, purely for display. Nothing here writes to it or
+  /// changes when/how it's computed.
+  final Map<DoseKey, DueStatusEntry> dueStatus;
+
   final VoidCallback onDelete;
   final VoidCallback onTap;
+
+  /// Whether dose [doseIndex] (scheduled at [doseTime]) has already been
+  /// taken for its current occurrence.
+  ///
+  /// Uses the exact same [currentDoseOccurrence] rule `isMedicationDue`
+  /// uses, rather than a plain "taken date == today" check — otherwise a
+  /// late-night dose confirmed just after midnight (stamped with
+  /// *yesterday's* date, see `_markTaken`) would wrongly show as "not taken"
+  /// for the rest of that day, which is exactly the double-dose confusion
+  /// this indicator exists to prevent.
+  bool _isTakenNow(DoseTime doseTime, int doseIndex) {
+    final occurrence = currentDoseOccurrence(
+      hour: doseTime.hour,
+      minute: doseTime.minute,
+      reminderWindowMinutes: medication.reminderWindowMinutes,
+      now: DateTime.now(),
+    );
+    if (occurrence == null) return false;
+    final status = dueStatus[(medication.id, doseIndex)];
+    return status?.takenDate == DueStatusStorage.todayString(occurrence);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1103,34 +1133,25 @@ class _MedicationCard extends StatelessWidget {
                         color: Color(0xFF1A4B8C),
                       ),
                     ),
-                    const SizedBox(height: 4),
-                    // Every dose time, wrapping onto a new line if there
-                    // isn't room for them all on one.
+                    const SizedBox(height: 6),
+                    // One chip per dose time, wrapping onto a new line if
+                    // there isn't room for them all on one. Each dose shows
+                    // its own taken/pending state independently — taking
+                    // the 8 AM dose never affects how the 2 PM dose looks.
                     Wrap(
-                      spacing: 14,
-                      runSpacing: 4,
-                      children: medication.doseTimes
-                          .map(
-                            (doseTime) => Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                const Icon(
-                                  Icons.access_time,
-                                  size: 18,
-                                  color: Colors.black54,
-                                ),
-                                const SizedBox(width: 4),
-                                Text(
-                                  doseTime.label,
-                                  style: const TextStyle(
-                                    fontSize: 18,
-                                    color: Colors.black54,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          )
-                          .toList(),
+                      spacing: 10,
+                      runSpacing: 8,
+                      children: medication.doseTimes.asMap().entries.map((
+                        entry,
+                      ) {
+                        final doseIndex = entry.key;
+                        final doseTime = entry.value;
+                        final taken = _isTakenNow(doseTime, doseIndex);
+                        return _DoseStatusChip(
+                          doseTime: doseTime,
+                          taken: taken,
+                        );
+                      }).toList(),
                     ),
                     const SizedBox(height: 4),
                     Text(
@@ -1159,6 +1180,76 @@ class _MedicationCard extends StatelessWidget {
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// One dose-time chip inside a `_MedicationCard`: a plain "clock + time"
+/// pill normally, or a bold green "checkmark + Taken" pill once that dose
+/// has been confirmed — so at a glance, an older adult can tell which of
+/// today's doses are already done without opening the medication.
+///
+/// The exact time it was tapped "I've taken it" isn't tracked anywhere in
+/// the app today (only the date), so this shows the dose's own scheduled
+/// time alongside "Taken" rather than a taken-at time, to avoid implying a
+/// precision the app doesn't actually have.
+///
+/// Every child of the `Wrap` in `_MedicationCard` (this one included) is
+/// laid out with a max width equal to the whole card's content width, not
+/// just "whatever's left on this line" — so on a multi-dose medication,
+/// each chip individually has to fit that full width on its own. The label
+/// `Text` is wrapped in `Flexible` so, if it ever doesn't fit at that width
+/// (a long device-language time format, very large accessibility text
+/// sizes, a narrow screen), it wraps onto a second line inside the chip
+/// instead of overflowing past the edge of the screen.
+class _DoseStatusChip extends StatelessWidget {
+  const _DoseStatusChip({required this.doseTime, required this.taken});
+
+  final DoseTime doseTime;
+  final bool taken;
+
+  @override
+  Widget build(BuildContext context) {
+    if (!taken) {
+      return Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.access_time, size: 18, color: Colors.black54),
+          const SizedBox(width: 4),
+          Flexible(
+            child: Text(
+              doseTime.label,
+              style: const TextStyle(fontSize: 18, color: Colors.black54),
+            ),
+          ),
+        ],
+      );
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      decoration: BoxDecoration(
+        color: Colors.green.shade50,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.green.shade700, width: 1.5),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.check_circle, size: 20, color: Colors.green.shade800),
+          const SizedBox(width: 6),
+          Flexible(
+            child: Text(
+              'Taken · ${doseTime.label}',
+              style: TextStyle(
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+                color: Colors.green.shade800,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
