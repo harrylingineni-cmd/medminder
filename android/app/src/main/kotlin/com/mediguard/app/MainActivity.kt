@@ -1,4 +1,4 @@
-package com.example.med_app
+package com.mediguard.app
 
 import io.flutter.embedding.android.FlutterActivity
 
