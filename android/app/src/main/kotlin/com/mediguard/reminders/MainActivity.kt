@@ -1,4 +1,4 @@
-package com.mediguard.app
+package com.mediguard.reminders
 
 import io.flutter.embedding.android.FlutterActivity
 
