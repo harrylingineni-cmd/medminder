@@ -2,7 +2,7 @@
 //
 // This is a hand-checked list of common Indian medicine BRAND names mapped
 // to their GENERIC name (the active ingredient(s) inside them). It powers
-// India mode on the "Find Generic" screen, so lookups work instantly and
+// India mode on the "Find Ingredient" screen, so lookups work instantly and
 // offline — no internet needed, unlike US mode which calls a live API.
 //
 // IMPORTANT: accuracy matters here, since this is health information.
@@ -14,7 +14,7 @@
 //     following the same "Brand: 'Generic'" pattern, and double-check each
 //     one against the strip/packaging or a pharmacist before adding it.
 //   - This is NOT a substitute for a doctor/pharmacist — see the disclaimer
-//     shown on the Find Generic screen.
+//     shown on the Find Ingredient screen.
 const Map<String, String> indiaBrandToGeneric = {
   // ── Pain relief / fever ──
   'Brufen': 'Ibuprofen',

@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:flutter_timezone/flutter_timezone.dart';
 import 'package:timezone/data/latest_all.dart' as tz_data;
@@ -15,6 +16,8 @@ class NotificationService {
 
   final FlutterLocalNotificationsPlugin _plugin =
       FlutterLocalNotificationsPlugin();
+  bool _initialized = false;
+  Future<void>? _initializing;
 
   // A "notification channel" is Android's way of grouping notifications so
   // the user can control their behaviour (sound, importance, etc.) in one
@@ -56,8 +59,9 @@ class NotificationService {
   // Android's 32-bit notification id limit (about 2.14 billion).
   static const int idSpace = 100000000; // 100 million
 
-  // How many dose times a single medication can have (matches the "Once a
-  // day" ... "5 times a day" choices offered in the Add/Edit form).
+  // The current form offers once, BID, TID, and QID. Keep one extra internal
+  // slot so a five-dose schedule saved by the student's previous version can
+  // still be edited or deleted without leaving notifications behind.
   static const int maxDosesPerMedication = 5;
 
   // The id offset between one dose and the next, within the same
@@ -72,6 +76,9 @@ class NotificationService {
   // medication ids (see main.dart) are always generated as an exact
   // multiple of this, guaranteeing that.
   static const int medicationIdSpace = 1000;
+  static const int _maxPlatformNotificationId = 0x7fffffff;
+  static const int _minPlatformNotificationId = -0x80000000;
+  static const int _iosPendingNotificationLimit = 64;
 
   // How often the "please confirm" reminder repeats once a dose is due.
   static const int repeatIntervalMinutes = 5;
@@ -86,6 +93,22 @@ class NotificationService {
   /// Must be called once before any scheduling happens — we call this from
   /// main() before runApp().
   Future<void> init() async {
+    if (_initialized) return;
+    final inProgress = _initializing;
+    if (inProgress != null) {
+      await inProgress;
+      return;
+    }
+    final initialization = _initialize();
+    _initializing = initialization;
+    try {
+      await initialization;
+    } finally {
+      _initializing = null;
+    }
+  }
+
+  Future<void> _initialize() async {
     // The `timezone` package ships its own database of the world's time
     // zones (rules for daylight saving, offsets, etc). It has to be loaded
     // once before we can create any "zoned" date/times.
@@ -99,8 +122,16 @@ class NotificationService {
     const androidSettings = AndroidInitializationSettings(
       '@mipmap/ic_launcher',
     );
-    const initSettings = InitializationSettings(android: androidSettings);
+    const initSettings = InitializationSettings(
+      android: androidSettings,
+      iOS: DarwinInitializationSettings(
+        requestAlertPermission: false,
+        requestBadgePermission: false,
+        requestSoundPermission: false,
+      ),
+    );
     await _plugin.initialize(settings: initSettings);
+    _initialized = true;
   }
 
   /// Asks the user for the two permissions Android requires for scheduled
@@ -120,6 +151,11 @@ class NotificationService {
         >();
     await androidPlugin?.requestNotificationsPermission();
     await androidPlugin?.requestExactAlarmsPermission();
+    final iosPlugin = _plugin
+        .resolvePlatformSpecificImplementation<
+          IOSFlutterLocalNotificationsPlugin
+        >();
+    await iosPlugin?.requestPermissions(alert: true, badge: true, sound: true);
   }
 
   /// Schedules a notification that fires every day at [hour]:[minute]
@@ -137,6 +173,7 @@ class NotificationService {
     required int hour,
     required int minute,
   }) async {
+    await _makeRoomForCriticalNotification(id);
     await _plugin.zonedSchedule(
       id: id,
       title: 'Time for your medication',
@@ -150,6 +187,7 @@ class NotificationService {
           importance: Importance.max,
           priority: Priority.high,
         ),
+        iOS: DarwinNotificationDetails(),
       ),
       // exactAllowWhileIdle = fire at the exact minute requested, even if
       // the phone is in Doze/low-power idle mode. This is what actually
@@ -175,6 +213,7 @@ class NotificationService {
     required String dosage,
     required DateTime fireAt,
   }) async {
+    await _makeRoomForCriticalNotification(id);
     await _plugin.zonedSchedule(
       id: id,
       title: 'Reminder: time for your medication',
@@ -188,6 +227,7 @@ class NotificationService {
           importance: Importance.max,
           priority: Priority.high,
         ),
+        iOS: DarwinNotificationDetails(),
       ),
       androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
     );
@@ -208,11 +248,10 @@ class NotificationService {
   /// instead of creating new, duplicate ones. That's what keeps repeats
   /// from stacking up.
   ///
-  /// Any repeat whose fire time has already passed is explicitly cancelled
-  /// instead of (re)scheduled, since `zonedSchedule` requires a future time.
-  /// This is also what makes the repeats "stop on their own" once the
-  /// reminder window has elapsed: we simply never schedule anything past
-  /// `anchorTime + reminderWindowMinutes`.
+  /// These are intentionally one-off notifications. A calendar-matching
+  /// notification can fire today even when its requested start date is
+  /// tomorrow, which would make reminders continue after the user taps Taken.
+  /// The app explicitly schedules tomorrow's chain after Taken or Snooze.
   Future<void> scheduleRepeatReminders({
     required int id,
     required String medicationName,
@@ -221,21 +260,29 @@ class NotificationService {
     required int reminderWindowMinutes,
   }) async {
     final now = DateTime.now();
-    final repeatCount = reminderWindowMinutes ~/ repeatIntervalMinutes;
-
-    for (var slot = 1; slot <= repeatCount; slot++) {
-      final repeatId = repeatNotificationId(id, slot);
+    final requestedCount = reminderWindowMinutes ~/ repeatIntervalMinutes;
+    final futureSlots = <int>[];
+    for (var slot = 1; slot <= requestedCount; slot++) {
       final fireAt = anchorTime.add(
         Duration(minutes: repeatIntervalMinutes * slot),
       );
+      if (fireAt.isAfter(now)) futureSlots.add(slot);
+    }
+    final allowedCount = await _countThatFitsPendingLimit([
+      for (var slot = 1; slot <= _maxRepeatSlots; slot++)
+        repeatNotificationId(id, slot),
+    ], futureSlots.length);
+    final allowedSlots = futureSlots.take(allowedCount).toSet();
 
-      if (fireAt.isBefore(now)) {
-        // This slot's moment is in the past (e.g. the app was closed and
-        // only reopened after it would have fired) — nothing to schedule,
-        // and cancel it in case an older schedule for it still exists.
+    for (var slot = 1; slot <= _maxRepeatSlots; slot++) {
+      final repeatId = repeatNotificationId(id, slot);
+      if (!allowedSlots.contains(slot)) {
         await cancel(repeatId);
         continue;
       }
+      final fireAt = anchorTime.add(
+        Duration(minutes: repeatIntervalMinutes * slot),
+      );
 
       await _plugin.zonedSchedule(
         id: repeatId,
@@ -250,10 +297,86 @@ class NotificationService {
             importance: Importance.max,
             priority: Priority.high,
           ),
+          iOS: DarwinNotificationDetails(),
         ),
         androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
       );
     }
+  }
+
+  /// Schedules one-off follow-ups after a ten-minute snooze. Negative ids are
+  /// deliberately used as a separate collision-free namespace from the
+  /// positive ids used by the normal one-off repeat series.
+  Future<void> scheduleSnoozeRepeatReminders({
+    required int id,
+    required String medicationName,
+    required String dosage,
+    required DateTime snoozeUntil,
+    required int reminderWindowMinutes,
+  }) async {
+    final requestedCount = reminderWindowMinutes ~/ repeatIntervalMinutes;
+    final repeatCount = await _countThatFitsPendingLimit([
+      for (var slot = 1; slot <= _maxRepeatSlots; slot++)
+        snoozeRepeatNotificationId(id, slot),
+    ], requestedCount);
+    for (var slot = 1; slot <= repeatCount; slot++) {
+      await _plugin.zonedSchedule(
+        id: snoozeRepeatNotificationId(id, slot),
+        title: 'Reminder: please confirm your medication',
+        body: '$medicationName - $dosage - still waiting for you to confirm',
+        scheduledDate: tz.TZDateTime.from(
+          snoozeUntil.add(Duration(minutes: repeatIntervalMinutes * slot)),
+          tz.local,
+        ),
+        notificationDetails: const NotificationDetails(
+          android: AndroidNotificationDetails(
+            _channelId,
+            _channelName,
+            channelDescription: _channelDescription,
+            importance: Importance.max,
+            priority: Priority.high,
+          ),
+          iOS: DarwinNotificationDetails(),
+        ),
+        androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+      );
+    }
+    for (var slot = repeatCount + 1; slot <= _maxRepeatSlots; slot++) {
+      await cancel(snoozeRepeatNotificationId(id, slot));
+    }
+  }
+
+  Future<int> _countThatFitsPendingLimit(
+    List<int> replaceableIds,
+    int requestedCount,
+  ) async {
+    if (defaultTargetPlatform != TargetPlatform.iOS) return requestedCount;
+    final replaceable = replaceableIds.toSet();
+    final pending = await _plugin.pendingNotificationRequests();
+    final unrelatedCount = pending
+        .where((request) => !replaceable.contains(request.id))
+        .length;
+    final available = _iosPendingNotificationLimit - unrelatedCount;
+    if (available <= 0) return 0;
+    return available < requestedCount ? available : requestedCount;
+  }
+
+  Future<void> _makeRoomForCriticalNotification(int id) async {
+    if (defaultTargetPlatform != TargetPlatform.iOS) return;
+    final pending = await _plugin.pendingNotificationRequests();
+    if (pending.any((request) => request.id == id) ||
+        pending.length < _iosPendingNotificationLimit) {
+      return;
+    }
+    // Daily dose and snooze alerts are more important than follow-ups. Remove
+    // one follow-up if iOS's fixed pending-request limit is already full.
+    for (final request in pending.reversed) {
+      if (request.id < 0 || request.id >= 2 * idSpace) {
+        await cancel(request.id);
+        return;
+      }
+    }
+    throw StateError('iOS has no pending notification slot available.');
   }
 
   /// Cancels every repeat reminder that could possibly be pending for dose
@@ -270,9 +393,33 @@ class NotificationService {
     }
   }
 
+  Future<void> cancelSnoozeRepeatReminders(int id) async {
+    for (var slot = 1; slot <= _maxRepeatSlots; slot++) {
+      await cancel(snoozeRepeatNotificationId(id, slot));
+    }
+  }
+
   /// Cancels the reminder previously scheduled with this [id] (for example
   /// when the user deletes that medication).
   Future<void> cancel(int id) => _plugin.cancel(id: id);
+
+  Future<void> _cancelIfPlatformIdIsValid(int id) async {
+    if (id < _minPlatformNotificationId || id > _maxPlatformNotificationId) {
+      return;
+    }
+    await cancel(id);
+  }
+
+  Future<void> cancelAllForDose(int doseId) async {
+    await _cancelIfPlatformIdIsValid(doseId);
+    await _cancelIfPlatformIdIsValid(snoozeNotificationId(doseId));
+    for (var slot = 1; slot <= _maxRepeatSlots; slot++) {
+      await _cancelIfPlatformIdIsValid(repeatNotificationId(doseId, slot));
+      await _cancelIfPlatformIdIsValid(
+        snoozeRepeatNotificationId(doseId, slot),
+      );
+    }
+  }
 
   /// Cancels absolutely everything that could be scheduled for
   /// [medicationId] — every dose slot's daily reminder, snooze reminder,
@@ -288,9 +435,7 @@ class NotificationService {
   Future<void> cancelAllForMedication(int medicationId) async {
     for (var doseIndex = 0; doseIndex < maxDosesPerMedication; doseIndex++) {
       final doseId = doseNotificationBaseId(medicationId, doseIndex);
-      await cancel(doseId); // daily reminder
-      await cancel(snoozeNotificationId(doseId)); // snooze reminder
-      await cancelRepeatReminders(doseId); // repeat-until-confirmed chain
+      await cancelAllForDose(doseId);
     }
   }
 
@@ -316,6 +461,9 @@ class NotificationService {
   static int repeatNotificationId(int doseId, int slot) =>
       doseId + (1 + slot) * idSpace;
 
+  static int snoozeRepeatNotificationId(int doseId, int slot) =>
+      -repeatNotificationId(doseId, slot);
+
   /// Whether the app currently has permission to show notifications at all.
   /// Used to show the "reminders may not appear" warning banner.
   Future<bool> areNotificationsEnabled() async {
@@ -323,7 +471,16 @@ class NotificationService {
         .resolvePlatformSpecificImplementation<
           AndroidFlutterLocalNotificationsPlugin
         >();
-    return await androidPlugin?.areNotificationsEnabled() ?? true;
+    if (androidPlugin != null) {
+      return await androidPlugin.areNotificationsEnabled() ?? false;
+    }
+
+    final iosPlugin = _plugin
+        .resolvePlatformSpecificImplementation<
+          IOSFlutterLocalNotificationsPlugin
+        >();
+    final iosPermissions = await iosPlugin?.checkPermissions();
+    return iosPermissions?.isEnabled ?? true;
   }
 
   /// Whether the app currently has permission to schedule *exact* alarms.
@@ -347,8 +504,15 @@ class NotificationService {
       hour,
       minute,
     );
-    if (scheduled.isBefore(now)) {
-      scheduled = scheduled.add(const Duration(days: 1));
+    if (!scheduled.isAfter(now)) {
+      scheduled = tz.TZDateTime(
+        tz.local,
+        now.year,
+        now.month,
+        now.day + 1,
+        hour,
+        minute,
+      );
     }
     return scheduled;
   }
